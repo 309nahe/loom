@@ -171,3 +171,7 @@ No External Network Exfiltration: Code parsed by Tree-sitter and embedded locall
 Path Sanitization: When handling file paths from MCP client inputs, always canonicalize and verify they remain within the target repository root to prevent path traversal attacks.
 
 Graceful Degradation: If an unknown file type or invalid syntax tree is encountered, Loom must log a warning via tracing::warn! and skip the unparseable node without crashing the daemon.
+
+6. documenting
+
+use DOCUMENTATION.md to keep track on the challenge faced, the swap in ideas, and as a general changelog, everytime you finish a task, it must be filled with the new stuff.
