@@ -28,23 +28,72 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 ---
 
-## 2. Technical Decisions & Swaps in Ideas
+## 2. Issue Deep-Dives & Implementation Logs
 
-- **Tool Protocol Enforcement**: Adhered to the `AGENTS.md` directive prioritizing the GitHub MCP protocol (`github-mcp-server`) for repository creation, file commits, and issue generation over raw unauthenticated shell calls.
-- **Modularity of Phase 1**: Separated the core symbol primitives (`SymbolId`, `SymbolNode`) from the graph structure (`CodeGraph`) and parser layer (`tree-sitter`) to enable isolated unit testing and clean crate/module layering.
+### 2.1 Issue #1: Core Symbol Schemas & Deterministic BLAKE3 Hashing
+
+#### Why We Did This First (Rationale & Pre-requisite Analysis)
+- **Zero-Dependency Domain Foundation**: In static code topography, the `SymbolNode` and `DependencyEdge` structs are the fundamental leaf models. Every downstream layer—`CodeGraph` (petgraph storage), Tree-sitter AST extractors, persistent redb cache tables, and JSON-RPC Model Context Protocol (MCP) responses—must agree on exact schema definitions.
+- **Enforcing Determinism Invariant from Day One**: Non-deterministic symbol IDs (e.g. UUIDs, memory pointers, auto-incrementing integers) are catastrophic for incremental dirty-file re-indexing and persistence. If a symbol's ID changes across daemon restarts or file re-parses, incremental graph diffing and caching break completely. Implementing deterministic BLAKE3 hashing first guarantees mathematical reproducibility:
+  $$\text{SymbolID} = \text{BLAKE3}(\text{file\_path} \parallel \text{namespace\_hierarchy} \parallel \text{symbol\_name} \parallel \text{signature})$$
+- **Preventing Downstream Cascading Refactors**: Establishing robust types with serialization (`serde`), error handling (`thiserror`), and strict zero-allocation boundaries early isolates data modeling from graph algorithm complexities.
+
+#### What We Did (Technical Implementation)
+1. **Workspace & Crate Setup**:
+   - Initialized a modern Cargo workspace targeting **Rust 2024 Edition / 1.85+**.
+   - Created the core domain crate `crates/loom-core` with zero internal crate dependencies.
+2. **Deterministic `SymbolId` (`crates/loom-core/src/id.rs`)**:
+   - Represented as a compact 16-byte fixed array (`[u8; 16]`) containing the truncated 128-bit BLAKE3 hash.
+   - Implemented `SymbolId::derive(...)` with explicit null-byte (`\0`) and namespace-delimiter (`::`) framing between variable-length inputs (`file_path`, `namespace_hierarchy`, `symbol_name`, `signature`) to mathematically prevent collision/concatenation attacks across variable-length components.
+   - Added hex serialization (`to_hex()`, `from_hex()`, `FromStr`, `Display`) and human-readable Serde dispatch (hex string in JSON/MCP; raw bytes in binary stores).
+3. **Symbol & Node Models (`crates/loom-core/src/symbol.rs`)**:
+   - Defined `SymbolKind` covering all language constructs: `Function`, `Method`, `Struct`, `Enum`, `Trait`, `Interface`, `TypeAlias`, `Constant`, and `Module`.
+   - Defined `SymbolNode` with exact byte ranges, line ranges, signatures, docstrings, visibility flags, and generational `epoch` counters for cache tracking.
+4. **Dependency Edge Schemas (`crates/loom-core/src/edge.rs`)**:
+   - Defined `EdgeKind` (`Calls`, `Instantiates`, `Implements`, `ReferencesType`, `Inherits`, `Imports`).
+   - Defined `DependencyEdge` with call site line numbers and conditional execution flags (`is_conditional`).
+5. **Typed Error Hierarchy (`crates/loom-core/src/error.rs`)**:
+   - Implemented `LoomError` utilizing `thiserror` for zero-panic, typed error propagation across parsing and decoding.
+
+#### Results & Verification
+- **Formatting**: `cargo fmt --check` passed cleanly across all crate targets.
+- **Strict Linting**: `cargo clippy --all-targets --all-features -- -D warnings` completed with zero warnings under `#![warn(clippy::pedantic)]`.
+- **Test Suite**: 9 unit tests passed in 0.00s covering:
+  - BLAKE3 hash stability across identical inputs.
+  - Signature and namespace collision resistance.
+  - Hex parsing and malformed string rejection.
+  - Serde JSON bidirectional round-trip serialization.
 
 ---
 
-## 3. Challenges Faced & Resolutions
+## 3. Technical Decisions & Swaps in Ideas
+
+- **Framed Delimiters in BLAKE3 Hashing**: Instead of naive byte concatenation `a + b + c`, inserted null delimiters `\0` and `::` between segments to eliminate collision ambiguity where boundary shifts could otherwise generate identical digests.
+- **Dual Serde Representation for `SymbolId`**: Formatted as 32-character hex strings in human-readable serializers (`serde_json`) for clean MCP inspection, while retaining efficient 16-byte binary serialization for disk/memory caches.
+- **Tool Protocol Enforcement**: Adhered to `AGENTS.md` prioritizing GitHub MCP tools (`github-mcp-server`) for issue inspection, status updates, and authenticated remote synchronization.
+
+---
+
+## 4. Challenges Faced & Resolutions
 
 | Challenge | Impact | Resolution |
 | :--- | :--- | :--- |
-| **Git Push HTTPS Authentication** | Standard `git push` over HTTPS prompted interactively for credentials. | Utilized GitHub MCP `push_files` to push commit directly and deterministically through the authenticated API. |
-| **Sandbox Connection Reset** | Occasional connection reset when launching subprocesses in the default sandbox. | Executed local git initialization and verified repository status with standard tool retries while relying on GitHub MCP tools for remote state. |
+| **Git Push HTTPS Authentication** | Standard `git push` over HTTPS prompted interactively for credentials. | Utilized GitHub MCP `push_files` to push commits directly and deterministically through the authenticated API. |
+| **Sandbox Subprocess Reset** | Transient sandbox socket reset during process startup. | Managed commands through resilient execution loops and leveraged native file/MCP tools for state management. |
 
 ---
 
-## 4. Changelog
+## 5. Changelog
+
+### [2026-09-25] - Issue #1 Implementation: Core Schemas & Deterministic Hashing
+- **Added**: `crates/loom-core` crate in Cargo workspace.
+- **Implemented**: `SymbolId` 128-bit truncated BLAKE3 deterministic hashing with boundary-safe delimiter framing.
+- **Implemented**: `SymbolNode` and `SymbolKind` semantic representations.
+- **Implemented**: `DependencyEdge` and `EdgeKind` dependency graph edge schemas.
+- **Implemented**: `LoomError` typed error enum using `thiserror`.
+- **Added**: Comprehensive unit test suite for determinism, collision resistance, and serde serialization.
+- **Verified**: Passed `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
+- **Updated**: [DOCUMENTATION.md](DOCUMENTATION.md) and closed [Issue #1](https://github.com/309nahe/loom/issues/1).
 
 ### [2026-09-25] - Repository Initialization & Phase 1 Planning
 - **Added**: [IDEA.md](IDEA.md) architecture blueprint and roadmap.
