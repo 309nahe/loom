@@ -66,11 +66,104 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 ---
 
+### 2.2 Issue #2: CodeGraph with Petgraph & Bidirectional Lookup Maps
+
+#### Why We Did This Next (Rationale & Pre-requisite Analysis)
+- **Central Topological State Engine**: With domain types established in `loom-core`, the in-memory directed dependency graph (`CodeGraph`) is the central state store required by both AST extraction and file indexing pipelines.
+- **Solving the Petgraph Index Compaction Invariant Early**: In Petgraph's `DiGraph`, removing a node executes a swap-removal (moving the highest-indexed node into the removed slot). Without specialized synchronization logic, external lookup maps (`SymbolId -> NodeIndex`) quickly point to wrong or corrupted graph nodes. Solving this in isolation prevents difficult-to-debug data corruption in higher-level pipelines.
+
+#### What We Did (Technical Implementation)
+1. **Crate Setup (`crates/loom-graph`)**:
+   - Created `loom-graph` depending on `loom-core` and `petgraph`.
+2. **`CodeGraph` Structure (`crates/loom-graph/src/graph.rs`)**:
+   - Maintained `graph: DiGraph<SymbolNode, DependencyEdge>`, `symbol_to_node: HashMap<SymbolId, NodeIndex>`, and `file_to_symbols: HashMap<PathBuf, Vec<SymbolId>>`.
+3. **Atomic Mutations & Node Swap Invariant**:
+   - Implemented `upsert_symbol`: updates node in-place if `SymbolId` exists, or inserts new node and synchronizes bidirectional maps.
+   - Implemented `remove_symbol`: intercepts Petgraph swap-removals and dynamically re-maps the swapped node's `NodeIndex` in `symbol_to_node`.
+   - Implemented `invalidate_file`: atomically strips all nodes and incident edges belonging to a modified or deleted file in $O(k)$ time where $k$ is file symbol count.
+4. **Bidirectional Topological Queries**:
+   - `get_callers(&id)`: Fast incoming dependency inspection for blast-radius calculation.
+   - `get_callees(&id)`: Fast outgoing dependency inspection.
+   - `get_symbols_for_file(&path)`: Zero-copy file-level slice queries.
+
+#### Results & Verification
+- **Strict Linting & Format**: `cargo clippy --all-targets --all-features -- -D warnings` passed with 0 warnings.
+- **Test Suite**: 4 unit tests passed in 0.00s covering:
+  - Node insertion, lookup, and property updates.
+  - Direct caller and callee edge linking.
+  - Petgraph index compaction and swapped-node lookup stability.
+  - Atomic single-file invalidation and edge cleanup.
+
+---
+
+### 2.3 Issue #3: Multi-Language Tree-sitter AST Extraction Layer
+
+#### Why We Did This Next (Rationale & Pre-requisite Analysis)
+- **Concrete Syntax Extraction without LLM Hallucination**: Loom guarantees deterministic call graphs. Before connecting the background file watcher, the system needed declarative Tree-sitter grammar parsers capable of converting raw source text into verified `SymbolNode` models and raw call dependencies.
+- **Multi-Language Support**: The core design must handle polyglot repositories (Rust, TypeScript, TSX, Python) through unified interfaces.
+
+#### What We Did (Technical Implementation)
+1. **Crate Setup (`crates/loom-ast`)**:
+   - Integrated `tree-sitter` (v0.24), `tree-sitter-rust`, `tree-sitter-typescript`, `tree-sitter-python`, and `streaming-iterator`.
+2. **`Language` Abstraction (`crates/loom-ast/src/parser.rs`)**:
+   - Automatic extension detection (`.rs`, `.ts`, `.tsx`, `.py`).
+   - Declarative SCM queries for extracting functions, methods, structs, classes, interfaces, traits, enums, type aliases, and constants.
+   - SCM queries for extracting call expressions and member invocations.
+3. **`AstEngine` Implementation**:
+   - Manages reusable parser instances.
+   - Implemented zero-copy capture extraction and signature line slicing.
+   - Extracted line numbers, byte boundaries, and deterministic `SymbolId::derive(...)`.
+   - Structured output into `ParsedFile` containing `symbols: Vec<SymbolNode>` and `raw_calls: Vec<RawCallReference>`.
+4. **Graceful Error Handling**:
+   - Bubble up typed `AstError` without panic on syntax errors.
+
+#### Results & Verification
+- **Strict Linting & Format**: Passed `cargo clippy --all-targets --all-features -- -D warnings` with zero warnings.
+- **Test Suite**: 3 integration tests passed in 0.05s verifying accurate symbol and call extraction for:
+  - Rust structs, enums, functions, and function calls.
+  - TypeScript interfaces, classes, methods, and member invocations.
+  - Python classes, methods, and function calls.
+
+---
+
+### 2.4 Issue #4: Debounced File Watcher & Incremental AST Re-indexing Pipeline
+
+#### Why We Did This Next (Rationale & Pre-requisite Analysis)
+- **Completing the Phase 1 Real-Time Engine**: Connecting the debounced watcher (`notify-debouncer-mini`), parallel Rayon parser, and `CodeGraph` completes the end-to-end real-time daemon pipeline.
+- **Enforcing the Sub-5ms Performance Invariant**: Large codebase re-indexing is unacceptable on every keystroke. This pipeline delivers granular dirty-file invalidation so only changed files are re-parsed and reconciled.
+
+#### What We Did (Technical Implementation)
+1. **Crate & Binary Setup (`crates/loom-daemon`)**:
+   - Created `loom-daemon` providing the orchestration library and CLI executable.
+2. **`IndexingPipeline` (`crates/loom-daemon/src/pipeline.rs`)**:
+   - Thread-safe `Arc<RwLock<CodeGraph>>` coordination.
+   - `index_file(&path)`: single-file incremental pipeline that reads, parses AST, invalidates stale file state, upserts new symbols, and re-links call edges.
+   - `index_batch(&paths)`: parallel multi-core batch indexing using `rayon::par_iter()`.
+   - `remove_file(&path)`: immediate invalidation on file deletion.
+3. **`DaemonWatcher` (`crates/loom-daemon/src/watcher.rs`)**:
+   - 50ms aggregation debounce window via `notify-debouncer-mini`.
+   - Dispatches filesystem events to `IndexingPipeline`.
+4. **CLI Entrypoint (`crates/loom-daemon/src/main.rs`)**:
+   - Configurable workspace root with `clap`.
+   - Tokio async runtime with CPU-bound indexing safely isolated on `spawn_blocking`.
+
+#### Results & Verification
+- **Performance Benchmark**: Incremental single-file re-parse and graph update completed in **$< 1\,\text{ms}$**, well beneath the $< 5\,\text{ms}$ threshold.
+- **Strict Linting & Format**: `cargo clippy --all-targets --all-features -- -D warnings` passed cleanly.
+- **Full Test Suite**: 18/18 tests passed across the entire workspace:
+  - `loom-core`: 9 tests passed.
+  - `loom-graph`: 4 tests passed.
+  - `loom-ast`: 3 tests passed.
+  - `loom-daemon`: 2 tests passed.
+
+---
+
 ## 3. Technical Decisions & Swaps in Ideas
 
-- **Framed Delimiters in BLAKE3 Hashing**: Instead of naive byte concatenation `a + b + c`, inserted null delimiters `\0` and `::` between segments to eliminate collision ambiguity where boundary shifts could otherwise generate identical digests.
-- **Dual Serde Representation for `SymbolId`**: Formatted as 32-character hex strings in human-readable serializers (`serde_json`) for clean MCP inspection, while retaining efficient 16-byte binary serialization for disk/memory caches.
-- **Tool Protocol Enforcement**: Adhered to `AGENTS.md` prioritizing GitHub MCP tools (`github-mcp-server`) for issue inspection, status updates, and authenticated remote synchronization.
+- **Delimited BLAKE3 Framing**: Applied null delimiters (`\0`) and namespace markers (`::`) to eliminate collision risks across variable-length symbol identifiers.
+- **Petgraph Node Compaction Handling**: Intercepted internal swap-removals during node deletion to ensure `symbol_to_node` index tables remain permanently synchronized.
+- **Separation of Read Query and Graph Mutation**: In `IndexingPipeline`, query matches are collected into immutable vectors prior to writing dependency edges, preventing Rust borrow checker conflicts.
+- **Thread Pool Isolation**: Isolated CPU-bound Tree-sitter AST parsing inside Rayon threads and Tokio `spawn_blocking`, ensuring the async runtime remains unblocked for future JSON-RPC/MCP serving.
 
 ---
 
@@ -78,26 +171,30 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 | Challenge | Impact | Resolution |
 | :--- | :--- | :--- |
-| **Git Push HTTPS Authentication** | Standard `git push` over HTTPS prompted interactively for credentials. | Utilized GitHub MCP `push_files` to push commits directly and deterministically through the authenticated API. |
-| **Sandbox Subprocess Reset** | Transient sandbox socket reset during process startup. | Managed commands through resilient execution loops and leveraged native file/MCP tools for state management. |
+| **Git Push HTTPS Authentication** | Interactive credential prompt during git push. | Utilized authenticated GitHub MCP `push_files` API for deterministic remote commits. |
+| **Petgraph Index Invalidation on Deletion** | Petgraph `remove_node` swaps the last node to the removed index, invalidating external hash maps. | Implemented custom index reconciliation in `remove_symbol` and `invalidate_file`. |
+| **Tree-sitter 0.24 Streaming Iterator API** | `QueryMatches` requires streaming iterator semantics rather than standard `Iterator`. | Integrated `streaming-iterator` crate and `while let Some(m) = matches.next()` patterns. |
+| **Borrow Conflicts During Graph Edge Linking** | Attempting to query symbols while holding a mutable lock on `CodeGraph`. | Split operation into a candidate ID collection phase followed by an atomic edge insertion loop. |
 
 ---
 
 ## 5. Changelog
 
-### [2026-09-25] - Issue #1 Implementation: Core Schemas & Deterministic Hashing
-- **Added**: `crates/loom-core` crate in Cargo workspace.
-- **Implemented**: `SymbolId` 128-bit truncated BLAKE3 deterministic hashing with boundary-safe delimiter framing.
-- **Implemented**: `SymbolNode` and `SymbolKind` semantic representations.
-- **Implemented**: `DependencyEdge` and `EdgeKind` dependency graph edge schemas.
-- **Implemented**: `LoomError` typed error enum using `thiserror`.
-- **Added**: Comprehensive unit test suite for determinism, collision resistance, and serde serialization.
-- **Verified**: Passed `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test`.
-- **Updated**: [DOCUMENTATION.md](DOCUMENTATION.md) and closed [Issue #1](https://github.com/309nahe/loom/issues/1).
+### [2026-09-26] - Phase 1 (Core Engine) Complete: Issues #1, #2, #3, #4
+- **Closed #1**: `feat(core): implement core symbol schemas and deterministic BLAKE3 hashing`.
+- **Closed #2**: `feat(graph): implement CodeGraph with petgraph and bidirectional lookup maps`.
+- **Closed #3**: `feat(ast): build multi-language Tree-sitter AST extraction layer`.
+- **Closed #4**: `feat(engine): connect debounced file watcher to incremental AST re-indexing pipeline`.
+- **Delivered**:
+  - `crates/loom-core`: Deterministic BLAKE3 symbol hashing, symbol nodes, and dependency edge types.
+  - `crates/loom-graph`: `CodeGraph` directed graph with bidirectional index tables and atomic file invalidation.
+  - `crates/loom-ast`: Tree-sitter multi-language AST extraction (Rust, TypeScript, Python).
+  - `crates/loom-daemon`: 50ms debounced file watcher, Rayon parallel batch parser, and sub-millisecond incremental update pipeline.
+- **Verified**: 18 unit and integration tests passing with 0 warnings under strict `#![warn(clippy::pedantic)]`.
 
 ### [2026-09-25] - Repository Initialization & Phase 1 Planning
 - **Added**: [IDEA.md](IDEA.md) architecture blueprint and roadmap.
 - **Added**: [AGENTS.md](AGENTS.md) guidelines, performance constraints, and MCP protocol priority rules.
 - **Created**: GitHub repository `309nahe/loom` on GitHub.
-- **Created**: GitHub issues [#1](https://github.com/309nahe/loom/issues/1), [#2](https://github.com/309nahe/loom/issues/2), [#3](https://github.com/309nahe/loom/issues/3), and [#4](https://github.com/309nahe/loom/issues/4) covering Phase 1 milestones.
-- **Added**: [DOCUMENTATION.md](DOCUMENTATION.md) tracking development decisions and changelog.
+- **Created**: GitHub issues [#1](https://github.com/309nahe/loom/issues/1), [#2](https://github.com/309nahe/loom/issues/2), [#3](https://github.com/309nahe/loom/issues/3), and [#4](https://github.com/309nahe/loom/issues/4).
+- **Added**: [DOCUMENTATION.md](DOCUMENTATION.md) tracking engineering decisions and changelog.

@@ -2,6 +2,9 @@
 resolver = "3"
 members = [
     "crates/loom-core",
+    "crates/loom-graph",
+    "crates/loom-ast",
+    "crates/loom-daemon",
 ]
 
 [workspace.package]
@@ -13,6 +16,16 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 loom-core = { path = "crates/loom-core" }
+loom-graph = { path = "crates/loom-graph" }
+loom-ast = { path = "crates/loom-ast" }
+loom-daemon = { path = "crates/loom-daemon" }
+
+# Tree-sitter & Parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.23"
+streaming-iterator = "0.1"
 
 # Serialization & Hashing
 blake3 = "1.5"
@@ -29,6 +42,14 @@ petgraph = { version = "0.6", features = ["serde-1"] }
 tokio = { version = "1.43", features = ["full"] }
 rayon = "1.10"
 
-# Logging
+# File Watching
+notify = "8.0"
+notify-debouncer-mini = "0.5"
+
+# Logging & CLI
+clap = { version = "4.5", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Testing
+tempfile = "3.17"
