@@ -154,11 +154,37 @@ pub struct ParsedFile {
     pub raw_calls: Vec<RawCallReference>,
 }
 
-/// AST Extraction engine managing Tree-sitter parsers and queries.
+struct LanguageConfig {
+    parser: Parser,
+    symbols_query: Query,
+    calls_query: Query,
+}
+
+impl LanguageConfig {
+    fn new(lang: Language) -> Self {
+        let ts_lang = lang.tree_sitter_language();
+        let mut parser = Parser::new();
+        let _ = parser.set_language(&ts_lang);
+
+        let symbols_query = Query::new(&ts_lang, lang.symbols_query())
+            .expect("static symbols query compilation must succeed");
+        let calls_query = Query::new(&ts_lang, lang.calls_query())
+            .expect("static calls query compilation must succeed");
+
+        Self {
+            parser,
+            symbols_query,
+            calls_query,
+        }
+    }
+}
+
+/// AST Extraction engine managing pre-compiled Tree-sitter parsers and queries.
 pub struct AstEngine {
-    rust: Parser,
-    typescript: Parser,
-    python: Parser,
+    rust: LanguageConfig,
+    typescript: LanguageConfig,
+    tsx: LanguageConfig,
+    python: LanguageConfig,
 }
 
 impl Default for AstEngine {
@@ -168,22 +194,14 @@ impl Default for AstEngine {
 }
 
 impl AstEngine {
-    /// Initializes a new `AstEngine` with language parsers.
+    /// Initializes a new `AstEngine` with pre-compiled language parsers and queries.
     #[must_use]
     pub fn new() -> Self {
-        let mut rust = Parser::new();
-        let _ = rust.set_language(&Language::Rust.tree_sitter_language());
-
-        let mut typescript = Parser::new();
-        let _ = typescript.set_language(&Language::TypeScript.tree_sitter_language());
-
-        let mut python = Parser::new();
-        let _ = python.set_language(&Language::Python.tree_sitter_language());
-
         Self {
-            rust,
-            typescript,
-            python,
+            rust: LanguageConfig::new(Language::Rust),
+            typescript: LanguageConfig::new(Language::TypeScript),
+            tsx: LanguageConfig::new(Language::Tsx),
+            python: LanguageConfig::new(Language::Python),
         }
     }
 
@@ -195,47 +213,36 @@ impl AstEngine {
         let language = Language::from_path(file_path)
             .ok_or_else(|| AstError::UnsupportedLanguage(file_path.to_path_buf()))?;
 
-        let parser = match language {
+        let config = match language {
             Language::Rust => &mut self.rust,
-            Language::TypeScript | Language::Tsx => &mut self.typescript,
+            Language::TypeScript => &mut self.typescript,
+            Language::Tsx => &mut self.tsx,
             Language::Python => &mut self.python,
         };
 
-        let tree = parser
+        let tree = config
+            .parser
             .parse(source_code, None)
             .ok_or_else(|| AstError::ParseFailed(file_path.to_path_buf()))?;
 
         let root_node = tree.root_node();
-        let ts_lang = language.tree_sitter_language();
 
-        let symbols = extract_symbols(language, &ts_lang, root_node, source_code, file_path)?;
-        let raw_calls = extract_calls(language, &ts_lang, root_node, source_code)?;
+        let symbols = extract_symbols(&config.symbols_query, root_node, source_code, file_path);
+        let raw_calls = extract_calls(&config.calls_query, root_node, source_code);
 
         Ok(ParsedFile { symbols, raw_calls })
     }
 }
 
 fn extract_symbols(
-    language: Language,
-    ts_lang: &TsLanguage,
+    symbols_query: &Query,
     root_node: Node<'_>,
     source_code: &str,
     file_path: &Path,
-) -> Result<Vec<SymbolNode>> {
-    let symbols_query = Query::new(ts_lang, language.symbols_query()).map_err(|e| {
-        AstError::QueryCompilationError {
-            language: match language {
-                Language::Rust => "rust",
-                Language::TypeScript | Language::Tsx => "typescript",
-                Language::Python => "python",
-            },
-            message: e.to_string(),
-        }
-    })?;
-
+) -> Vec<SymbolNode> {
     let capture_names = symbols_query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&symbols_query, root_node, source_code.as_bytes());
+    let mut matches = cursor.matches(symbols_query, root_node, source_code.as_bytes());
 
     let mut symbols = Vec::new();
     let file_path_str = file_path.to_string_lossy();
@@ -288,29 +295,17 @@ fn extract_symbols(
         }
     }
 
-    Ok(symbols)
+    symbols
 }
 
 fn extract_calls(
-    language: Language,
-    ts_lang: &TsLanguage,
+    calls_query: &Query,
     root_node: Node<'_>,
     source_code: &str,
-) -> Result<Vec<RawCallReference>> {
-    let calls_query = Query::new(ts_lang, language.calls_query()).map_err(|e| {
-        AstError::QueryCompilationError {
-            language: match language {
-                Language::Rust => "rust",
-                Language::TypeScript | Language::Tsx => "typescript",
-                Language::Python => "python",
-            },
-            message: e.to_string(),
-        }
-    })?;
-
+) -> Vec<RawCallReference> {
     let capture_names = calls_query.capture_names();
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&calls_query, root_node, source_code.as_bytes());
+    let mut matches = cursor.matches(calls_query, root_node, source_code.as_bytes());
 
     let mut raw_calls = Vec::new();
 
@@ -344,7 +339,7 @@ fn extract_calls(
         }
     }
 
-    Ok(raw_calls)
+    raw_calls
 }
 
 #[cfg(test)]

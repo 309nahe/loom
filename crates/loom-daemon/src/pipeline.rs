@@ -1,5 +1,6 @@
 //! Incremental AST indexing and graph reconciliation pipeline.
 
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -10,6 +11,10 @@ use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_graph::graph::CodeGraph;
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
+
+thread_local! {
+    static THREAD_AST_ENGINE: RefCell<AstEngine> = RefCell::new(AstEngine::new());
+}
 
 /// Thread-safe orchestration engine managing AST parsing and graph reconciliation.
 #[derive(Clone)]
@@ -43,8 +48,13 @@ impl IndexingPipeline {
             return None;
         };
 
-        let mut engine = AstEngine::new();
-        let parsed = match engine.parse_source(file_path, &source_code) {
+        let parsed_res = THREAD_AST_ENGINE.with(|engine_cell| {
+            engine_cell
+                .borrow_mut()
+                .parse_source(file_path, &source_code)
+        });
+
+        let parsed = match parsed_res {
             Ok(res) => res,
             Err(err) => {
                 warn!("AST parsing failed for {:?}: {}", file_path, err);
@@ -66,14 +76,15 @@ impl IndexingPipeline {
     pub fn index_batch(&self, file_paths: &[PathBuf]) -> std::time::Duration {
         let start = Instant::now();
 
-        // 1. Parallel AST Extraction via Rayon
+        // 1. Parallel AST Extraction via Rayon with Thread-Local Parsers
         let parsed_batch: Vec<(PathBuf, ParsedFile)> = file_paths
             .par_iter()
             .filter(|path| Language::from_path(path).is_some())
             .filter_map(|path| {
                 let source = fs::read_to_string(path).ok()?;
-                let mut engine = AstEngine::new();
-                let parsed = engine.parse_source(path, &source).ok()?;
+                let parsed = THREAD_AST_ENGINE.with(|engine_cell| {
+                    engine_cell.borrow_mut().parse_source(path, &source).ok()
+                })?;
                 Some((path.clone(), parsed))
             })
             .collect();
@@ -127,11 +138,16 @@ impl IndexingPipeline {
                 .collect();
 
             for target_id in matching_target_ids {
-                // Find caller symbol enclosing this call site line
+                // Find caller symbol with tightest enclosing span around call site
                 let caller_symbol = parsed
                     .symbols
                     .iter()
-                    .find(|s| s.line_range.0 <= call.line && call.line <= s.line_range.1);
+                    .filter(|s| s.line_range.0 <= call.line && call.line <= s.line_range.1)
+                    .min_by_key(|s| {
+                        let span = s.line_range.1.saturating_sub(s.line_range.0);
+                        let kind_penalty = u8::from(!s.kind.is_callable());
+                        (kind_penalty, span)
+                    });
 
                 if let Some(caller) = caller_symbol {
                     let edge = DependencyEdge::new(EdgeKind::Calls, call.line, call.is_conditional);
@@ -163,12 +179,16 @@ mod tests {
         let graph = Arc::new(RwLock::new(CodeGraph::new()));
         let pipeline = IndexingPipeline::new(graph.clone());
 
-        // Perform single-file index
+        // Warm up thread-local parser
+        let _ = pipeline.index_file(&file_path);
+
+        // Perform single-file index and measure latency
         let duration = pipeline.index_file(&file_path).expect("index successful");
-        // Verify sub-5ms performance requirement
+
+        // Verify strict sub-5ms performance requirement
         assert!(
-            duration.as_millis() < 50,
-            "Indexing must be fast (took {duration:?})"
+            duration.as_millis() < 5,
+            "Indexing must be sub-5ms (took {duration:?})"
         );
 
         let read_graph = graph.read().expect("read graph");
