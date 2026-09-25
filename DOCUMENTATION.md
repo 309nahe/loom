@@ -26,6 +26,17 @@ This document tracks engineering decisions, architectural trade-offs, challenges
    - Integrate `notify-debouncer-mini` (50ms window) and `rayon` thread pool.
    - Enforce $< 5\,\text{ms}$ incremental invalidation and update cycles.
 
+### 1.3 GitHub Issues Created for Phase 2 (Reachability & Graph Analysis)
+1. **[Issue #5](https://github.com/309nahe/loom/issues/5) — `feat(graph): implement transitive BFS/DFS reachability and shortest-path dependency traversals`**
+   - Transitive caller/callee traversal with configurable depth limits and cycle detection.
+   - Exact shortest-path dependency chain discovery between symbols.
+2. **[Issue #6](https://github.com/309nahe/loom/issues/6) — `feat(analysis): build blast-radius calculation engine with risk heuristics`**
+   - Transitive blast radius evaluation, impact coefficient computation, risk levels (`Low`, `Medium`, `High`, `Critical`), and test suite association.
+3. **[Issue #7](https://github.com/309nahe/loom/issues/7) — `feat(analysis): implement dead code and orphan symbol detection`**
+   - Unused internal symbol identification (`in_degree == 0`) and mutual dead dependency cycle detection.
+4. **[Issue #8](https://github.com/309nahe/loom/issues/8) — `test(bench): implement comprehensive graph traversal benchmarks & real-world repo test suite`**
+   - Scaled microbenchmarks ($10{,}000$ to $50{,}000$ nodes), $< 2\,\text{ms}$ traversal assertions, and topological edge-case suites.
+
 ---
 
 ## 2. Issue Deep-Dives & Implementation Logs
@@ -226,6 +237,14 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 ---
 
 ## 5. Changelog
+
+### [2026-09-26] - Phase 2 (Reachability & Graph Analysis) Inception & Issue Breakdown
+- **Created Issues**:
+  - [Issue #5](https://github.com/309nahe/loom/issues/5): `feat(graph): implement transitive BFS/DFS reachability and shortest-path dependency traversals`.
+  - [Issue #6](https://github.com/309nahe/loom/issues/6): `feat(analysis): build blast-radius calculation engine with risk heuristics`.
+  - [Issue #7](https://github.com/309nahe/loom/issues/7): `feat(analysis): implement dead code and orphan symbol detection`.
+  - [Issue #8](https://github.com/309nahe/loom/issues/8): `test(bench): implement comprehensive graph traversal benchmarks & real-world repo test suite`.
+- **Roadmap Alignment**: Mapped Phase 2 technical requirements from [IDEA.md](IDEA.md) into concrete, atomic deliverables adhering to $< 2\,\text{ms}$ latency budgets.
 
 ### [2026-09-26] - Comprehensive Phase 1 Test Suite & Performance Optimizations
 - **Delivered**:
