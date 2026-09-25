@@ -227,7 +227,13 @@ impl AstEngine {
 
         let root_node = tree.root_node();
 
-        let symbols = extract_symbols(&config.symbols_query, root_node, source_code, file_path);
+        let symbols = extract_symbols(
+            &config.symbols_query,
+            root_node,
+            source_code,
+            file_path,
+            language,
+        );
         let raw_calls = extract_calls(&config.calls_query, root_node, source_code);
 
         Ok(ParsedFile { symbols, raw_calls })
@@ -239,6 +245,7 @@ fn extract_symbols(
     root_node: Node<'_>,
     source_code: &str,
     file_path: &Path,
+    language: Language,
 ) -> Vec<SymbolNode> {
     let capture_names = symbols_query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -286,10 +293,25 @@ fn extract_symbols(
                     Err(_) => name.to_string(),
                 };
 
+                let is_exported = match language {
+                    Language::Rust => signature.starts_with("pub"),
+                    Language::TypeScript | Language::Tsx => signature.starts_with("export"),
+                    Language::Python => !name.starts_with('_'),
+                };
+
                 let id = SymbolId::derive(&file_path_str, &[], name, &signature);
 
                 symbols.push(SymbolNode::new(
-                    id, name, kind, file_path, byte_range, line_range, None, signature, true, 1,
+                    id,
+                    name,
+                    kind,
+                    file_path,
+                    byte_range,
+                    line_range,
+                    None,
+                    signature,
+                    is_exported,
+                    1,
                 ));
             }
         }

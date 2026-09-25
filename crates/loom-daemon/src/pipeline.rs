@@ -89,9 +89,45 @@ impl IndexingPipeline {
             })
             .collect();
 
-        // 2. Atomic Graph Reconciliation
-        for (path, parsed) in parsed_batch {
-            self.reconcile_parsed_file(&path, parsed);
+        // 2. Atomic Graph Reconciliation (Two-pass for complete cross-file symbol resolution)
+        if let Ok(mut graph) = self.graph.write() {
+            for (path, parsed) in &parsed_batch {
+                graph.invalidate_file(path);
+                for symbol in &parsed.symbols {
+                    graph.upsert_symbol(symbol.clone());
+                }
+            }
+
+            for (_path, parsed) in &parsed_batch {
+                for call in &parsed.raw_calls {
+                    let matching_target_ids: Vec<loom_core::id::SymbolId> = graph
+                        .get_symbols_by_name(&call.callee_name)
+                        .into_iter()
+                        .map(|s| s.id)
+                        .collect();
+
+                    for target_id in matching_target_ids {
+                        let caller_symbol = parsed
+                            .symbols
+                            .iter()
+                            .filter(|s| s.line_range.0 <= call.line && call.line <= s.line_range.1)
+                            .min_by_key(|s| {
+                                let span = s.line_range.1.saturating_sub(s.line_range.0);
+                                let kind_penalty = u8::from(!s.kind.is_callable());
+                                (kind_penalty, span)
+                            });
+
+                        if let Some(caller) = caller_symbol {
+                            let edge = DependencyEdge::new(
+                                EdgeKind::Calls,
+                                call.line,
+                                call.is_conditional,
+                            );
+                            let _ = graph.add_edge(caller.id, target_id, edge);
+                        }
+                    }
+                }
+            }
         }
 
         let elapsed = start.elapsed();
