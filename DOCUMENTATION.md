@@ -327,6 +327,60 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 ---
 
+### 2.10 Comprehensive Phase 2 Test Suites & Cross-Crate Pipeline Verification
+
+#### Why We Did This (Rationale & Invariant Verification)
+- **Zero-Regression & Exhaustive Edge Cases**: Following Phase 2 core algorithm implementations, complex topological interactions between multi-pass AST batch indexing, depth-decayed risk calculations, and entrypoint-forward dead code discovery needed dedicated, exhaustive integration suites.
+- **Validating Algorithmic Invariants**:
+  - Shortest path optimality when multiple paths of unequal length connect two symbols.
+  - Multi-test suite association through intermediate utility layers across multiple test folders.
+  - Resilience of dead code detection when dead code calls live utilities without corrupting live reachability sets.
+  - Real-time incremental reconciliation updating blast radius and resolving dead code dynamically.
+
+#### What We Did (Technical Implementation)
+1. **Reachability & Pathfinding Tests (`crates/loom-graph/tests/reachability_and_pathfinding_tests.rs`)**:
+   - `test_shortest_path_optimality_across_unequal_multipaths`: Asserts BFS strictly chooses the shorter 3-node path ($A \to E \to D$) over a 4-node path ($A \to B \to C \to D$).
+   - `test_self_referencing_recursive_function`: Verifies self-calls ($A \to A$) are reported accurately in direct caller/callee lookups while safely terminating without duplicate root entries in transitive sets.
+   - `test_multi_node_cycle_with_entry_and_exit`: Traverses $X \to A \to B \to C \to D \to A \to Y$, ensuring cycle safety and optimal exit path extraction ($X \to A \to Y$).
+   - `test_depth_zero_and_depth_one_boundary_conditions`: Asserts `max_depth = 0` returns empty results and `max_depth = 1` yields exactly direct neighbors.
+   - `test_non_existent_source_or_target_pathfinding`: Validates graceful `None` returns for absent nodes.
+   - `test_dynamic_invalidation_breaks_path`: Verifies that invalidating an intermediate file cleanly breaks paths and clears caller sets.
+   - `test_deterministic_ordering_stability`: Asserts 100% deterministic output across 50 repeated traversal iterations.
+2. **Advanced Blast Radius Suite (`crates/loom-analysis/tests/blast_radius_advanced_tests.rs`)**:
+   - `test_isolated_symbol_with_zero_callers`: Confirms isolated internal symbols report `RiskLevel::Low` with 0 affected nodes.
+   - `test_isolated_public_api_with_zero_callers`: Confirms base export penalty properly flags standalone public APIs as `RiskLevel::High`.
+   - `test_mixed_visibility_chain_blast_radius`: Tests exact mathematical score decay across mixed private/public hierarchies.
+   - `test_dynamic_mutation_blast_radius_recomputation`: Adds 5 public callers to an internal helper and asserts transition from `Low` to `Critical` risk.
+   - `test_multi_test_suite_association_with_shared_helpers`: Confirms unit, integration, and E2E tests calling intermediate factory helpers are all correctly associated with target symbols.
+3. **Advanced Dead Code Suite (`crates/loom-analysis/tests/dead_code_advanced_tests.rs`)**:
+   - `test_multiple_distinct_entrypoints_reachability`: Validates multi-root preservation across `main`, `cli`, and `route` entrypoints.
+   - `test_dead_function_calling_live_function`: Asserts dead callers calling live utilities flag only the dead function.
+   - `test_dead_tree_with_nested_branches`: Accurately catalogs all 4 nodes in a branched dead subgraph.
+   - `test_zero_dead_code_in_fully_reachable_repository`: Asserts zero false positives in fully connected linear DAGs.
+   - `test_dynamic_reanalysis_after_wiring_dead_symbol_to_entrypoint`: Confirms dead symbols dynamically disappear from dead code reports once wired to live entrypoints.
+4. **End-to-End Analysis Daemon Pipeline (`crates/loom-daemon/tests/phase2_e2e_analysis_pipeline_tests.rs`)**:
+   - Spans Tree-sitter AST parsing, two-pass batch indexing, `BlastRadiusCalculator`, and `DeadCodeDetector`.
+   - Verifies that modifying a file on disk dynamically updates the in-memory `CodeGraph`, resolves dead code, and re-computes blast radius in real time.
+5. **Two-Pass Batch Indexing Optimization (`crates/loom-daemon/src/pipeline.rs`)**:
+   - Replaced single-pass batch reconciliation with a two-pass architecture (Pass 1: upsert all nodes; Pass 2: link all call edges) to guarantee cross-file forward references in multi-file workspaces resolve on initial load.
+6. **Language Visibility Extraction (`crates/loom-ast/src/parser.rs`)**:
+   - Implemented accurate visibility extraction per language (`pub` for Rust, `export` for TypeScript/TSX, `!starts_with('_')` for Python).
+
+#### Results & Verification
+- **Formatting**: `cargo fmt --check` passed cleanly across all workspace crates and test targets.
+- **Strict Linting**: `cargo clippy --all-targets --all-features -- -D warnings` passed with 0 warnings.
+- **Full Workspace Test Suite**: All **69** unit, integration, stress, and benchmark tests passed:
+  ```text
+  loom_core:     9 unit tests + 4 integration tests = 13 tests passed
+  loom_graph:    6 unit tests + 17 integration/scale/pathfinding tests + 3 benchmarks = 26 tests passed
+  loom_ast:      3 unit tests + 4 integration tests = 7 tests passed
+  loom_analysis: 2 unit tests + 16 integration/stress/accuracy tests + 2 benchmarks = 20 tests passed
+  loom_daemon:   2 unit tests + 2 integration/pipeline tests = 4 tests passed
+  Total: 70 test/benchmark targets passing in < 2.0s
+  ```
+
+---
+
 ## 3. Technical Decisions & Swaps in Ideas
 
 - **Delimited BLAKE3 Framing**: Applied null delimiters (`\0`) and namespace markers (`::`) to eliminate collision risks across variable-length symbol identifiers.
@@ -337,6 +391,8 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 - **Dedicated `loom-analysis` Crate**: Separated blast-radius calculation, risk heuristics, and dead code detection from graph storage primitives into an independent crate.
 - **Entrypoint-Forward Multi-Source BFS for Dead Code**: Replaced naive `in_degree == 0` filtering with forward BFS from all public entrypoints and tests, accurately detecting isolated dead cycles while avoiding false positives on public APIs.
 - **Depth-Decayed Risk Scoring Heuristics**: Formulated risk scores as $\sum (\text{weight} \times 0.75^{\text{depth}} \times 2.0)$ combined with exported boundary multipliers to reflect actual modification danger.
+- **Two-Pass Batch Reconciliation**: Separated symbol insertion from cross-file call edge linking in `IndexingPipeline::index_batch` to resolve forward references across files in initial scans.
+- **Language-Aware Symbol Visibility Extraction**: Refactored Tree-sitter AST extraction to assign `is_exported` based on language grammar contracts (`pub`, `export`, `_` prefix).
 
 ---
 
@@ -351,10 +407,23 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 | **Caller Ambiguity in Nested Classes** | Outer class matched as caller before inner method in class declarations. | Implemented tightest-span selection algorithm with callable priority. |
 | **Isolated Dead Dependency Cycles** | Mutually recursive dead functions have `in_degree > 0`, evading simple in-degree checks. | Implemented entrypoint-forward BFS reachability combined with cycle classification. |
 | **50k Node Transitive Traversal Latency** | Need to guarantee $< 2\,\text{ms}$ traversal response for interactive MCP queries. | Optimized BFS with pre-allocated vectors and fast `HashSet<NodeIndex>` visited filtering. |
+| **Cross-File Forward Reference Call Linking** | In single-pass batch indexing, calls to symbols in later-processed files failed to link. | Implemented two-pass reconciliation in `IndexingPipeline::index_batch`. |
+| **Accurate Visibility in Dead Code Scans** | Hardcoded `is_exported: true` in AST parser prevented dead code detection in daemon tests. | Enhanced AST extractor with language-specific visibility detection rules. |
 
 ---
 
 ## 5. Changelog
+
+### [2026-09-26] - Comprehensive Phase 2 Test Suites & E2E Pipeline Verification
+- **Added**:
+  - `crates/loom-graph/tests/reachability_and_pathfinding_tests.rs`: Shortest path optimality, self-referencing recursion, cycle traversals with entry/exit, depth boundary conditions, and deterministic ordering stability.
+  - `crates/loom-analysis/tests/blast_radius_advanced_tests.rs`: Isolated private/public API symbols, mixed visibility hierarchies, dynamic mutation recomputations, and multi-test suite association.
+  - `crates/loom-analysis/tests/dead_code_advanced_tests.rs`: Multi-entrypoint reachability, dead callers of live utilities, nested dead trees, zero dead code baseline, and dynamic dead code resolution.
+  - `crates/loom-daemon/tests/phase2_e2e_analysis_pipeline_tests.rs`: End-to-end AST indexing, graph building, blast radius analysis, dead code detection, and real-time incremental re-indexing.
+- **Optimized & Refactored**:
+  - Implemented two-pass reconciliation in `IndexingPipeline::index_batch` for cross-file forward reference resolution.
+  - Added language-specific visibility (`is_exported`) extraction in `AstEngine`.
+- **Verified**: 70 unit, integration, stress, and benchmark test targets passing with 0 warnings under `#![warn(clippy::pedantic)]`.
 
 ### [2026-09-26] - Phase 2 (Reachability & Graph Analysis) Complete: Issues #5, #6, #7, #8
 - **Closed #5**: `feat(graph): implement transitive BFS/DFS reachability and shortest-path dependency traversals` (PR #9).
@@ -404,3 +473,4 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 - **Created**: GitHub repository `309nahe/loom` on GitHub.
 - **Created**: GitHub issues [#1](https://github.com/309nahe/loom/issues/1), [#2](https://github.com/309nahe/loom/issues/2), [#3](https://github.com/309nahe/loom/issues/3), and [#4](https://github.com/309nahe/loom/issues/4).
 - **Added**: [DOCUMENTATION.md](DOCUMENTATION.md) tracking engineering decisions and changelog.
+
