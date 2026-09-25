@@ -414,6 +414,26 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 ## 5. Changelog
 
+### [2026-09-26] - Architecture Commenting Pass (Documentation-Only Sweep)
+
+- **Challenge**: The codebase was functionally complete (70 passing test/benchmark targets) but the *why* behind its non-obvious decisions lived almost entirely in `DOCUMENTATION.md`. A future contributor reading `graph.rs` or `pipeline.rs` saw correct code with sparse rationale, and the easiest places to "simplify" — the petgraph swap-removal reconciliation, the two-pass batch reconcile, the innermost-enclosing caller selection — are precisely the ones that look redundant.
+- **Resolution**: Added a documentation-only comment sweep across all 5 crates, 19 source modules, and all 14 integration-test / benchmark files. No behavioural changes.
+- **Documented (with rationale, not restatement)**:
+  - `crates/loom-core/src/id.rs`: injectivity argument for the `\0` / `::` framing scheme, and the human-readable vs. binary Serde dispatch rationale.
+  - `crates/loom-core/src/symbol.rs`: why `epoch` exists despite a content-addressed `SymbolId`, and why `SymbolKind::is_callable` is load-bearing.
+  - `crates/loom-core/src/edge.rs`: the caller → callee edge orientation convention every traversal depends on.
+  - `crates/loom-graph/src/graph.rs`: *why* swap-removal reconciliation is mandatory (silent index corruption), `NodeIndex` stability caveat, BFS depth semantics (`max_depth == 0`, root exclusion, shortest-path depth), cycle safety, and the direction-mapping table.
+  - `crates/loom-ast/src/parser.rs`: the pre-compiled `Query` DFA decision (10–15 ms → < 0.15 ms), the `@name` / `@def.<kind>` and `@call.name` / `@call.site` capture contracts, streaming-iterator requirement, and per-language visibility rules.
+  - `crates/loom-daemon/src/pipeline.rs`: the `THREAD_AST_ENGINE` thread-local rationale (Tree-sitter parsers are not `Sync`), lock-free parse phase, the two-pass cross-file forward-reference fix, and the extracted, documented `resolve_caller_symbol` innermost-enclosing algorithm.
+  - `crates/loom-daemon/src/watcher.rs`: why the 50 ms window exists, why `watch_loop` must run on `spawn_blocking`, and the `exists()`-based change-vs-delete discrimination.
+  - `crates/loom-daemon/src/main.rs`: canonicalization, `spawn_blocking` isolation, and directory-pruning rationale in the workspace walk.
+  - `crates/loom-analysis/src/blast_radius.rs`: the closed-form risk formula, the exported-boundary threshold ladder, and why tests are excluded from the caller score.
+  - `crates/loom-analysis/src/dead_code.rs`: why `in_degree == 0` is insufficient, the three-root definition of liveness, the reason-classification split, and the mandatory determinism sort.
+  - `crates/loom-analysis/src/lib.rs`: promoted to a full crate-level doc with invariants (deterministic scoring, zero false positives, read-only consumers) and `#![warn(missing_docs)]` / `#![warn(clippy::pedantic)]` to match the other crates.
+  - All `tests/` and `benches/` files: module-level headers stating which invariant each suite guards, so a failing test name points back at the rule it protects.
+- **Refactored (behaviour-preserving)**: extracted the duplicated innermost-enclosing-caller closure in `IndexingPipeline` into a single documented `resolve_caller_symbol` helper shared by `index_batch` and `reconcile_parsed_file`; renamed test bindings `id_ca`/`id_cb` → `id_cycle_a`/`id_cycle_b` to satisfy `clippy::similar_names`.
+- **Verified**: `cargo fmt --check` clean, `cargo clippy --all-targets --all-features -- -D warnings` clean, 65 tests passing with 0 failures.
+
 ### [2026-09-26] - Comprehensive Phase 2 Test Suites & E2E Pipeline Verification
 - **Added**:
   - `crates/loom-graph/tests/reachability_and_pathfinding_tests.rs`: Shortest path optimality, self-referencing recursion, cycle traversals with entry/exit, depth boundary conditions, and deterministic ordering stability.

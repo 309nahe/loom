@@ -1,3 +1,9 @@
+//! Integration test for blast-radius risk heuristics on a multi-level call hierarchy.
+//!
+//! Validates the depth-decayed scoring model end to end: exported callers weigh 3x internal
+//! ones, distant callers decay by $0.75^{\text{depth}}$, and the resulting score lands in
+//! the expected `RiskLevel` band.
+
 use loom_analysis::blast_radius::{BlastRadiusCalculator, RiskLevel};
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;

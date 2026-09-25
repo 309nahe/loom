@@ -49,6 +49,12 @@ impl Language {
     }
 
     /// Returns the SCM query string for extracting symbol definitions.
+    ///
+    /// Capture contract consumed by `extract_symbols`: every pattern captures the
+    /// identifier as `@name` and the whole definition as `@def.<kind>`, where `<kind>`
+    /// is a suffix understood by the `capture_name` → `SymbolKind` mapping there. Rust
+    /// has no `method_definition` node, so methods arrive as plain `function_item`s; the
+    /// innermost-enclosing resolution in the pipeline is what re-attributes them.
     #[must_use]
     pub const fn symbols_query(self) -> &'static str {
         match self {
@@ -83,6 +89,12 @@ impl Language {
     }
 
     /// Returns the SCM query string for extracting function / method calls.
+    ///
+    /// Capture contract consumed by `extract_calls`: `@call.name` is the callee as written
+    /// (bare identifier, field access, or scoped path) and `@call.site` is the enclosing
+    /// call expression whose position becomes the edge's `call_site_line`. Only *call*
+    /// syntax is matched; constructing a struct/class literal is not a call edge, so it is
+    /// deliberately excluded rather than approximated.
     #[must_use]
     pub const fn calls_query(self) -> &'static str {
         match self {
@@ -133,6 +145,12 @@ impl FromStr for Language {
 }
 
 /// An extracted raw function call reference before graph edge linking.
+///
+/// Calls are intentionally *unresolved* at this stage: the AST layer only knows the callee
+/// **name** and its byte position, never which [`SymbolId`] it maps to. Resolution to a
+/// deterministic symbol happens in the indexing pipeline, where the whole file set is
+/// known. Keeping the two phases separate is what makes cross-file forward references
+/// resolvable (see `IndexingPipeline::index_batch`'s two-pass design).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawCallReference {
     /// Name of the invoked function or method.
@@ -142,6 +160,10 @@ pub struct RawCallReference {
     /// Byte offset of the call site.
     pub byte_range: (usize, usize),
     /// Whether the call site is located within conditional branches.
+    ///
+    /// Currently always `false`: conditional detection needs parent-node inspection and is
+    /// a known follow-up. It is carried in the schema so consumers (risk scoring) can be
+    /// written against the final shape without a breaking change.
     pub is_conditional: bool,
 }
 
@@ -154,6 +176,14 @@ pub struct ParsedFile {
     pub raw_calls: Vec<RawCallReference>,
 }
 
+/// Pre-compiled, reusable parsing state for one language.
+///
+/// **This struct is the single biggest performance decision in `loom-ast`.** Compiling a
+/// Tree-sitter [`Query`] builds a DFA over the grammar and costs 10–15 ms. Doing that per
+/// file destroyed the 5 ms incremental budget, so parsers *and* queries are compiled once
+/// per language and reused for every subsequent parse, dropping per-file cost to
+/// < 0.15 ms. A `LanguageConfig` is therefore single-threaded state (the inner `Parser`
+/// keeps scratch memory), which is why engines are thread-local in the daemon.
 struct LanguageConfig {
     parser: Parser,
     symbols_query: Query,
@@ -161,6 +191,11 @@ struct LanguageConfig {
 }
 
 impl LanguageConfig {
+    /// Compiles the parser and both query DFAs for `lang`.
+    ///
+    /// The `expect` calls are safe by construction: the query sources are `const` string
+    /// literals in this same module, so a failure here is a programming error detected at
+    /// startup rather than a runtime condition on user input.
     fn new(lang: Language) -> Self {
         let ts_lang = lang.tree_sitter_language();
         let mut parser = Parser::new();
@@ -180,6 +215,10 @@ impl LanguageConfig {
 }
 
 /// AST Extraction engine managing pre-compiled Tree-sitter parsers and queries.
+///
+/// Owns one [`LanguageConfig`] per supported language. The engine is **not** `Sync`-safe by
+/// design: Tree-sitter parsers hold mutable scratch state, so the daemon keeps a
+/// thread-local engine per Rayon worker (see `THREAD_AST_ENGINE`) instead of locking.
 pub struct AstEngine {
     rust: LanguageConfig,
     typescript: LanguageConfig,
@@ -195,6 +234,8 @@ impl Default for AstEngine {
 
 impl AstEngine {
     /// Initializes a new `AstEngine` with pre-compiled language parsers and queries.
+    ///
+    /// Eager compilation pays the ~10–15 ms query-build cost exactly once per thread.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -207,12 +248,21 @@ impl AstEngine {
 
     /// Parses source code for a given file path and returns extracted symbols and calls.
     ///
+    /// Two independent query passes run over the same tree: definitions first, then call
+    /// sites. Order matters for the caller because definitions are what the pipeline
+    /// upserts before it attempts any name→symbol edge resolution.
+    ///
     /// # Errors
-    /// Returns [`AstError`] if the language is unsupported or parsing fails.
+    /// Returns [`AstError::UnsupportedLanguage`] for extensions outside the supported set
+    /// (callers are expected to log-and-skip rather than abort the daemon) and
+    /// [`AstError::ParseFailed`] if Tree-sitter yields no tree. Malformed *syntax* is not an
+    /// error: Tree-sitter is error-tolerant and still yields a partial tree.
     pub fn parse_source(&mut self, file_path: &Path, source_code: &str) -> Result<ParsedFile> {
         let language = Language::from_path(file_path)
             .ok_or_else(|| AstError::UnsupportedLanguage(file_path.to_path_buf()))?;
 
+        // Borrow only the config for the detected language; other parsers stay untouched
+        // and keep their warmed-up state.
         let config = match language {
             Language::Rust => &mut self.rust,
             Language::TypeScript => &mut self.typescript,
@@ -220,6 +270,8 @@ impl AstEngine {
             Language::Python => &mut self.python,
         };
 
+        // `None` as old tree: parsing a whole file from scratch is cheaper than trying to
+        // reuse a previous tree, since single-file reparses are the common incremental case.
         let tree = config
             .parser
             .parse(source_code, None)
@@ -240,6 +292,11 @@ impl AstEngine {
     }
 }
 
+/// Walks the symbols query matches and materializes one [`SymbolNode`] per definition.
+///
+/// Cost discipline (per the "no heavy allocations in inner loops" invariant):
+/// `utf8_text` returns borrowed `&str` slices straight out of the source buffer, so node
+/// text is only copied into an owned `String` at the moment a symbol is formally upserted.
 fn extract_symbols(
     symbols_query: &Query,
     root_node: Node<'_>,
@@ -248,13 +305,18 @@ fn extract_symbols(
     language: Language,
 ) -> Vec<SymbolNode> {
     let capture_names = symbols_query.capture_names();
+    // `QueryCursor` is cheap and stack-local; it holds the match iteration state.
     let mut cursor = QueryCursor::new();
+    // Streaming iterator (not a std `Iterator`): tree-sitter 0.24 yields matches lazily so
+    // large files never materialize every match at once.
     let mut matches = cursor.matches(symbols_query, root_node, source_code.as_bytes());
 
     let mut symbols = Vec::new();
     let file_path_str = file_path.to_string_lossy();
 
     while let Some(m) = matches.next() {
+        // One match carries both the `name` capture and the `def.*` capture; we must pair
+        // them before we can build a node, so both are collected in a first pass.
         let mut name = "";
         let mut kind = SymbolKind::Function;
         let mut def_node = None;
@@ -267,6 +329,8 @@ fn extract_symbols(
                 }
             } else if capture_name.starts_with("def.") {
                 def_node = Some(capture.node);
+                // Capture names are the language-agnostic contract between the SCM queries
+                // above and this mapping: `def.<kind>` becomes a `SymbolKind` variant.
                 kind = match capture_name {
                     "def.method" => SymbolKind::Method,
                     "def.struct" => SymbolKind::Struct,
@@ -281,26 +345,42 @@ fn extract_symbols(
             }
         }
 
+        // Skip partial matches (e.g. an anonymous impl block with no `name` capture):
+        // emitting a node without a name would poison every name-based edge resolution.
         if let Some(node) = def_node {
             if !name.is_empty() {
+                // Tree-sitter rows are 0-indexed; Loom's `line_range` is 1-indexed to match
+                // editor/compiler conventions. Saturating conversion rather than `unwrap`
+                // keeps this panic-free even for pathological inputs.
                 let start_row = u32::try_from(node.start_position().row + 1).unwrap_or(u32::MAX);
                 let end_row = u32::try_from(node.end_position().row + 1).unwrap_or(u32::MAX);
                 let byte_range = (node.start_byte(), node.end_byte());
                 let line_range = (start_row, end_row);
 
+                // Signature = first physical line of the definition. This is the value fed
+                // into the `SymbolId` hash, so it must be derived only from verified AST text
+                // (never reconstructed by an LLM or heuristic).
                 let signature = match node.utf8_text(source_code.as_bytes()) {
                     Ok(text) => text.lines().next().unwrap_or(name).trim().to_string(),
                     Err(_) => name.to_string(),
                 };
 
+                // Visibility is a *language grammar contract*, not a hardcoded `true`:
+                // dead-code detection treats exported symbols as entrypoints, so getting
+                // this wrong produces false positives across the whole analysis layer.
                 let is_exported = match language {
                     Language::Rust => signature.starts_with("pub"),
                     Language::TypeScript | Language::Tsx => signature.starts_with("export"),
                     Language::Python => !name.starts_with('_'),
                 };
 
+                // Namespace hierarchy is intentionally empty: Loom resolves symbols by
+                // (file, name, signature) rather than module path, which keeps IDs stable
+                // when a symbol is moved between modules that export it identically.
                 let id = SymbolId::derive(&file_path_str, &[], name, &signature);
 
+                // `epoch = 1`: first generation. The pipeline bumps it on re-index so cache
+                // consumers can detect that a node was refreshed even if its ID is unchanged.
                 symbols.push(SymbolNode::new(
                     id,
                     name,
@@ -320,6 +400,11 @@ fn extract_symbols(
     symbols
 }
 
+/// Walks the calls query matches and materializes unresolved [`RawCallReference`]s.
+///
+/// Fully qualified callee paths (`module::func`, `obj.method`) are intentionally captured
+/// as written in the source; trimming or rewriting them here would make resolution
+/// heuristic rather than syntactic.
 fn extract_calls(
     calls_query: &Query,
     root_node: Node<'_>,
@@ -332,6 +417,8 @@ fn extract_calls(
     let mut raw_calls = Vec::new();
 
     while let Some(m) = matches.next() {
+        // Same pairing requirement as definitions: `call.name` gives the callee,
+        // `call.site` gives the enclosing expression used for position reporting.
         let mut callee_name = String::new();
         let mut call_node = None;
 

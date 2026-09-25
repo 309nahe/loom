@@ -1,3 +1,12 @@
+//! Full-stack Phase 2 pipeline test: source text → AST → graph → analysis → live update.
+//!
+//! The only place where all four crates are exercised together. It validates that
+//! 1. two-pass batch indexing resolves the cross-file forward reference from `main` to
+//!    `api::handle_request` on the *first* scan,
+//! 2. `BlastRadiusCalculator` reports the expected callers and associated test,
+//! 3. `DeadCodeDetector` isolates the unreachable `dead_backup_routine` cluster,
+//! 4. mutating a file on disk updates all three layers without a full workspace rescan.
+
 use loom_analysis::blast_radius::BlastRadiusCalculator;
 use loom_analysis::dead_code::DeadCodeDetector;
 use loom_daemon::pipeline::IndexingPipeline;

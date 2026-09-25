@@ -1,3 +1,10 @@
+//! Advanced dead code cases focused on false-positive avoidance.
+//!
+//! The riskiest failure mode for this engine is reporting *live* code as dead. Each test
+//! here pins one way that must not happen: many distinct entrypoints, dead callers of live
+//! utilities, nested dead trees, a fully connected repository, and a symbol that becomes
+//! live only after being wired to an entrypoint.
+
 use loom_analysis::dead_code::{DeadCodeDetector, DeadSymbolReason};
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;

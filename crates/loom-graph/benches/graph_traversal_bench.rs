@@ -1,3 +1,10 @@
+//! Criterion benchmarks for `CodeGraph` traversal performance at scale.
+//!
+//! Builds synthetic branching DAGs of 1k / 10k / 50k nodes and measures the three queries the
+//! MCP tools expose (5-level transitive callers, transitive callees, shortest path). These
+//! numbers are the evidence behind the < 2 ms interactive latency budget; a regression here
+//! means the analysis layer can no longer answer in real time on large repositories.
+
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};

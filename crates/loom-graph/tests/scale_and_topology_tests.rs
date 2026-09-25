@@ -1,3 +1,11 @@
+//! Topological stress tests and hard latency assertions for `CodeGraph` traversals.
+//!
+//! Two responsibilities:
+//! 1. **Pathological topologies** — diamonds, dense cycles, $N=100$ linear chains, and
+//!    disconnected forests — must terminate in a single pass and report each node once.
+//! 2. **Latency budget** — 5-level transitive traversals over 10k and 50k node graphs must
+//!    stay under 2 ms, the interactive ceiling for MCP tool responses.
+
 use std::time::Instant;
 
 use loom_core::edge::{DependencyEdge, EdgeKind};

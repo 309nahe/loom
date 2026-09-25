@@ -1,3 +1,9 @@
+//! Advanced blast-radius cases: boundary conditions and dynamic recomputation.
+//!
+//! Covers isolated symbols, standalone public APIs, mixed visibility chains, risk escalation
+//! as callers are added at runtime, and test-suite association through shared intermediate
+//! helpers (the "unit + integration + E2E all call the same factory" scenario).
+
 use loom_analysis::blast_radius::{BlastRadiusCalculator, RiskLevel};
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;

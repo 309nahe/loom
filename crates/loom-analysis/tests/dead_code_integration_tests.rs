@@ -1,3 +1,9 @@
+//! Integration test for dead code detection across a multi-module repository.
+//!
+//! Confirms the entrypoint-forward reachability rule: a live path from `main` is kept, an
+//! unreferenced internal helper is flagged as `UnreferencedInternalSymbol`, and a mutually
+//! recursive island is flagged as `IsolatedDeadCycle` rather than missed.
+
 use loom_analysis::dead_code::{DeadCodeDetector, DeadSymbolReason};
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;

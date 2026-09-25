@@ -1,3 +1,9 @@
+//! Integration tests for multi-language Tree-sitter extraction.
+//!
+//! Covers Rust, TypeScript, and TSX/Python symbol and call extraction, asserts sub-millisecond
+//! parse latency, and — most importantly — asserts that malformed source degrades gracefully
+//! (partial results, no panic), which is the daemon's zero-hallucination guarantee.
+
 use loom_ast::parser::AstEngine;
 use loom_core::symbol::SymbolKind;
 use std::path::Path;

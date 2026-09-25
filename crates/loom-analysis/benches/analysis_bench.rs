@@ -1,3 +1,9 @@
+//! Criterion benchmarks for the `loom-analysis` engines.
+//!
+//! Measures `BlastRadiusCalculator` and `DeadCodeDetector` over 1k and 10k node synthetic
+//! graphs. Both engines are read-only passes over the graph, so these numbers also serve as a
+//! proxy for "cost of one MCP analysis request" and must stay negligible next to a keystroke.
+
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};

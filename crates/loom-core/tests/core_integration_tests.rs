@@ -1,3 +1,10 @@
+//! Integration tests for `loom-core` determinism and serialization contracts.
+//!
+//! These tests guard the project's foundational invariant: a symbol's identity must be a
+//! pure function of its (path, name, signature). If this suite fails, every downstream cache,
+//! incremental diff, and cross-restart graph is suspect — so the cases below hammer
+//! stability across many runs and probe the delimiter scheme for concatenation collisions.
+
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::error::LoomError;
 use loom_core::id::SymbolId;

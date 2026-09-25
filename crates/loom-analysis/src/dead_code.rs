@@ -37,6 +37,10 @@ pub struct DeadCodeReport {
 }
 
 /// Dead code analysis engine.
+///
+/// Read-only over a borrowed [`CodeGraph`], mirroring
+/// [`crate::blast_radius::BlastRadiusCalculator`]: analysis never mutates topology, so it
+/// can run against a read-locked graph snapshot while the watcher keeps indexing.
 #[derive(Debug, Clone)]
 pub struct DeadCodeDetector<'a> {
     graph: &'a CodeGraph,
@@ -50,6 +54,16 @@ impl<'a> DeadCodeDetector<'a> {
     }
 
     /// Scans the entire graph and returns all detected orphan and dead symbols.
+    ///
+    /// Algorithm: **entrypoint-forward multi-source BFS**, not an `in_degree == 0` filter.
+    ///
+    /// Why the naive filter is wrong: mutually recursive dead functions all have
+    /// `in_degree > 0`, so in-degree alone misses entire dead clusters, while a plain
+    /// "nobody calls me" rule also flags legitimately public API and tests. Instead we
+    /// compute the *forward-reachable set* from every legitimate root and declare
+    /// everything else dead, which handles both cases uniformly.
+    ///
+    /// Complexity: one full graph scan plus one $O(V + E)$ BFS.
     #[must_use]
     pub fn find_dead_symbols(&self) -> DeadCodeReport {
         let mut dead_symbols = Vec::new();
@@ -58,8 +72,14 @@ impl<'a> DeadCodeDetector<'a> {
         // - is_exported == true
         // - Known entrypoint names ("main", "init", "run", "handler", etc.)
         // - Test symbols (they are test entrypoints)
+        //
+        // Three roots are required to keep false positives at zero: exported symbols may be
+        // consumed from outside the indexed graph, conventional entrypoints are invoked by
+        // the runtime/framework rather than by code we can see, and tests are entrypoints.
         let mut entrypoint_indices = Vec::new();
 
+        // Iterate the `SymbolId -> NodeIndex` map rather than `node_weights()`: it is the
+        // same node set, and going through indices keeps every later lookup O(1).
         for &node_idx in self.graph.symbol_to_node.values() {
             if let Some(node) = self.graph.graph.node_weight(node_idx) {
                 if is_entrypoint_or_exported(node) {
@@ -72,13 +92,19 @@ impl<'a> DeadCodeDetector<'a> {
         let mut reachable_indices = HashSet::new();
         let mut queue = VecDeque::new();
 
+        // Seed all roots before draining the queue: this is a multi-source BFS, so a symbol
+        // is live if *any* root reaches it.
         for entry_idx in entrypoint_indices {
             if reachable_indices.insert(entry_idx) {
                 queue.push_back(entry_idx);
             }
         }
 
+        // Cycle-safe by construction: the `insert` result gates enqueueing, so recursive
+        // and mutually recursive live code terminates in a single pass.
         while let Some(curr_idx) = queue.pop_front() {
+            // Direction is unfiltered on purpose: a symbol reached only via a type
+            // reference or import is still *used*, and must not be reported as dead.
             for edge_ref in self
                 .graph
                 .graph
@@ -96,6 +122,11 @@ impl<'a> DeadCodeDetector<'a> {
             if !reachable_indices.contains(&node_idx) {
                 if let Some(node) = self.graph.graph.node_weight(node_idx) {
                     // Check if it has 0 inbound edges or is in an isolated cycle
+                    //
+                    // Reachability already established "dead"; in-degree now only
+                    // *explains why*, so the user gets an actionable diagnostic:
+                    // nobody references it at all, vs. it is part of a mutually recursive
+                    // island that no entrypoint can reach.
                     let in_degree = self
                         .graph
                         .graph
@@ -116,6 +147,10 @@ impl<'a> DeadCodeDetector<'a> {
         }
 
         // Sort by file_path and line number for determinism
+        //
+        // Required, not cosmetic: iteration order of a `HashMap` is randomized per process,
+        // so without this the report would differ between runs and break both the
+        // deterministic-output tests and any cache keyed on the report.
         dead_symbols.sort_by(|a, b| {
             a.symbol
                 .file_path
@@ -132,17 +167,26 @@ impl<'a> DeadCodeDetector<'a> {
 }
 
 /// Checks if a symbol represents an entrypoint or exported surface.
+///
+/// The definition of "root" for dead-code reachability. All three branches are
+/// conservative: each one admits symbols that a name-based scan alone would wrongly call
+/// dead. Because false *positives* here make real dead code look alive, the bias is
+/// deliberately toward admitting more roots rather than fewer.
 #[must_use]
 pub fn is_entrypoint_or_exported(symbol: &SymbolNode) -> bool {
+    // Consumers outside the indexed graph may use it; we cannot prove otherwise.
     if symbol.is_exported {
         return true;
     }
 
+    // Conventional runtime/framework hooks, matched exactly so that an unrelated private
+    // `run()` helper is not promoted to a root.
     let name = symbol.name.as_str();
     if name == "main" || name == "run" || name == "init" {
         return true;
     }
 
+    // Tests are entrypoints: they are invoked by a test runner, not by production code.
     crate::blast_radius::is_test_symbol(symbol)
 }
 
@@ -186,8 +230,8 @@ mod tests {
 
         let id_main = main_fn.id;
         let id_live = live_helper.id;
-        let id_ca = cycle_a.id;
-        let id_cb = cycle_b.id;
+        let id_cycle_a = cycle_a.id;
+        let id_cycle_b = cycle_b.id;
 
         graph.upsert_symbol(main_fn);
         graph.upsert_symbol(live_helper);
@@ -200,9 +244,11 @@ mod tests {
             .add_edge(id_main, id_live, edge.clone())
             .expect("add main->live");
         graph
-            .add_edge(id_ca, id_cb, edge.clone())
+            .add_edge(id_cycle_a, id_cycle_b, edge.clone())
             .expect("add ca->cb");
-        graph.add_edge(id_cb, id_ca, edge).expect("add cb->ca");
+        graph
+            .add_edge(id_cycle_b, id_cycle_a, edge)
+            .expect("add cb->ca");
 
         let detector = DeadCodeDetector::new(&graph);
         let report = detector.find_dead_symbols();

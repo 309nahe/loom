@@ -86,6 +86,10 @@ pub struct BlastRadiusReport {
 }
 
 /// Blast radius computation engine.
+///
+/// Purely read-only view over a borrowed [`CodeGraph`]: it owns no state and mutates
+/// nothing, so the daemon can hold it against a read-locked graph for the duration of a
+/// single MCP request without any risk of deadlocking the writer side.
 #[derive(Debug, Clone)]
 pub struct BlastRadiusCalculator<'a> {
     graph: &'a CodeGraph,
@@ -99,11 +103,25 @@ impl<'a> BlastRadiusCalculator<'a> {
     }
 
     /// Computes the complete blast radius report for a given target symbol ID.
+    ///
+    /// The risk model is fully deterministic — no heuristics, no LLM:
+    ///
+    /// $$\text{RiskScore} = \text{base\_export\_penalty} + \sum_{u \in \text{Callers}} \left( \text{criticality}(u) \times 0.75^{\text{depth}(u)} \times 2.0 \right)$$
+    ///
+    /// where `base_export_penalty = 15.0` when the *target itself* is exported and
+    /// `criticality(u)` is `3.0` for exported callers, `1.0` for internal ones.
+    ///
+    /// Rationale: callers that are close to the target (low depth) and cross a public API
+    /// boundary are the ones that actually break builds, so they dominate the score. Depth
+    /// decay encodes "distant transitive callers matter less".
+    ///
+    /// Returns `None` when the target symbol is absent from the graph, which callers must
+    /// surface as "unknown symbol" rather than an empty report.
     #[must_use]
     pub fn calculate(&self, target_id: &SymbolId, max_depth: usize) -> Option<BlastRadiusReport> {
         let target_node = self.graph.get_symbol(target_id)?.clone();
 
-        // 1. Direct callers
+        // 1. Direct callers (depth 1): the concrete "if you break this, these break" set.
         let direct_callers_raw = self.graph.get_callers(target_id);
         let mut direct_callers = Vec::with_capacity(direct_callers_raw.len());
         for (node, edge) in direct_callers_raw {
@@ -116,20 +134,26 @@ impl<'a> BlastRadiusCalculator<'a> {
             });
         }
 
-        // 2. Transitive callers
+        // 2. Transitive callers: a single depth-bounded, cycle-safe BFS upstream.
         let transitive_raw = self.graph.find_transitive_callers(target_id, max_depth);
         let mut transitive_callers = Vec::new();
         let mut associated_tests = Vec::new();
 
         let mut risk_score = 0.0;
+        // Tracks whether the change escapes the crate/package boundary — this flag, not the
+        // raw score alone, decides which threshold ladder is applied below.
         let mut public_api_impacted = target_node.is_exported;
 
+        // Flat penalty: touching an exported symbol at all is a breaking-change risk even
+        // if nobody calls it inside the repository (consumers live outside the graph).
         if target_node.is_exported {
             risk_score += 15.0;
         }
 
         for (node, depth) in transitive_raw {
             if is_test_symbol(&node) {
+                // Tests are reported separately: they are *evidence of impact* ("this test
+                // will fail"), not callers to warn about, and must not inflate the score.
                 associated_tests.push(AssociatedTestDetail {
                     id: node.id,
                     name: node.name.clone(),
@@ -137,6 +161,8 @@ impl<'a> BlastRadiusCalculator<'a> {
                     call_site_line: node.line_range.0,
                 });
             } else if depth > 1 {
+                // Depth 1 is already covered by `direct_callers`; listing it again would
+                // double-count in `total_affected_symbols`.
                 transitive_callers.push(TransitiveCallerDetail {
                     id: node.id,
                     name: node.name.clone(),
@@ -159,6 +185,11 @@ impl<'a> BlastRadiusCalculator<'a> {
         let total_affected = direct_callers.len() + transitive_callers.len();
 
         // Determine Risk Level & Rationale
+        //
+        // Two independent ladders: public-boundary symbols are graded on a stricter scale
+        // than purely internal ones, because breaking an export costs downstream consumers
+        // that are not represented in this graph at all. `|| total_affected >= N` guards
+        // keep wide-but-shallow fan-out from being scored as Low by the decay factor alone.
         let (risk_level, risk_rationale) = if public_api_impacted {
             if risk_score >= 20.0 || total_affected >= 5 {
                 (
@@ -217,6 +248,12 @@ impl<'a> BlastRadiusCalculator<'a> {
 }
 
 /// Helper function to detect if a symbol belongs to a test suite.
+///
+/// Syntactic, cross-language convention matching (no LLM, no framework introspection):
+/// Rust/TS use `test_*` / `*_test` / `*Test`, Python uses `test_*`, and the path check
+/// catches suites that do not follow a naming convention at all (`__tests__/`, `tests/`).
+/// False positives here are cheap — a symbol wrongly called a test is merely *excluded*
+/// from the caller score — whereas a missed test would hide real breakage from the user.
 #[must_use]
 pub fn is_test_symbol(symbol: &SymbolNode) -> bool {
     let name_lower = symbol.name.to_lowercase();

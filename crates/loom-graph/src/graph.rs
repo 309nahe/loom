@@ -91,6 +91,9 @@ impl CodeGraph {
     }
 
     /// Finds all symbols with a matching name.
+    ///
+    /// Linear scan over node weights: intended for MCP lookups and resolution fallbacks
+    /// where a repo-wide name is ambiguous. Hot paths must resolve by [`SymbolId`].
     #[must_use]
     pub fn get_symbols_by_name<'a>(&'a self, name: &str) -> Vec<&'a SymbolNode> {
         self.graph
@@ -100,6 +103,10 @@ impl CodeGraph {
     }
 
     /// Retrieves all symbols defined within a specific file path.
+    ///
+    /// Driven by the `file_to_symbols` reverse index, so it stays $O(k)$ in the file's
+    /// symbol count instead of scanning the whole graph. Unknown files return an empty
+    /// vector (graceful degradation for deleted or never-indexed paths).
     #[must_use]
     pub fn get_symbols_for_file<'a>(&'a self, path: &Path) -> Vec<&'a SymbolNode> {
         let Some(ids) = self.file_to_symbols.get(path) else {
@@ -113,12 +120,20 @@ impl CodeGraph {
     ///
     /// If the symbol already exists, its metadata is updated in-place.
     /// If it is new, it is added and registered in both lookup maps.
+    ///
+    /// The returned [`NodeIndex`] is stable for the lifetime of the node: a later
+    /// [`CodeGraph::remove_symbol`] of an *unrelated* node may relocate this node's
+    /// index, which is exactly why `symbol_to_node` must be re-synchronized on removal.
+    /// Callers that need a permanent handle should retain the `SymbolId` instead.
     pub fn upsert_symbol(&mut self, node: SymbolNode) -> NodeIndex {
         let symbol_id = node.id;
         let file_path = node.file_path.clone();
 
         if let Some(&existing_idx) = self.symbol_to_node.get(&symbol_id) {
-            // Update existing weight
+            // Fast path: the deterministic `SymbolId` already exists, so refresh the
+            // metadata (line ranges, signature, epoch, ...) without touching the topology.
+            // Edges are intentionally preserved: re-parsing a file must not sever callers
+            // that live in *other* files, they are re-linked by the indexing pipeline.
             if let Some(weight) = self.graph.node_weight_mut(existing_idx) {
                 *weight = node;
             }
@@ -135,6 +150,11 @@ impl CodeGraph {
     }
 
     /// Adds a directed dependency edge from `source_id` to `target_id`.
+    ///
+    /// Edges are oriented caller → callee, so the source is the *impacted* symbol when
+    /// walking inbound neighbours. Both endpoints are resolved through
+    /// [`CodeGraph::symbol_to_node`], which guarantees that traversal algorithms never
+    /// observe a stale [`NodeIndex`].
     ///
     /// # Errors
     /// Returns [`GraphError::EndpointNotFound`] if either `source_id` or `target_id` is missing.
@@ -159,9 +179,18 @@ impl CodeGraph {
     /// Removes a single symbol and all its incident edges from the graph.
     ///
     /// Handles Petgraph's internal node swap correctly, updating index references.
+    ///
+    /// # Why the reconciliation below is mandatory
+    /// `DiGraph::remove_node` is a *swap-removal*: the highest-indexed node is moved into
+    /// the freed slot. Any external `SymbolId -> NodeIndex` table would silently start
+    /// pointing at the wrong node, corrupting every subsequent traversal (a classic
+    /// "works until you delete a file" class of bug). We therefore re-read the node that
+    /// landed on `node_idx` and repoint its mapping.
     pub fn remove_symbol(&mut self, id: SymbolId) -> Option<SymbolNode> {
         let node_idx = self.symbol_to_node.remove(&id)?;
 
+        // Capture the pre-removal tail index; after the swap-removal it is either the
+        // removed node itself (nothing moved) or the node that got relocated.
         let old_last_idx = NodeIndex::new(self.graph.node_count().saturating_sub(1));
         let removed = self.graph.remove_node(node_idx);
 
@@ -171,6 +200,8 @@ impl CodeGraph {
             self.symbol_to_node.insert(swapped_symbol.id, node_idx);
         }
 
+        // Keep the file index consistent: drop the dead id and forget files that no
+        // longer contribute any symbol, so `file_count` stays truthful.
         if let Some(ref node) = removed {
             if let Some(symbols) = self.file_to_symbols.get_mut(&node.file_path) {
                 symbols.retain(|&s_id| s_id != id);
@@ -186,6 +217,12 @@ impl CodeGraph {
     /// Atomically removes all symbols defined in `file_path` and their incident edges.
     ///
     /// Used for single-file incremental invalidation when a file is modified or deleted.
+    ///
+    /// This is the backbone of the incremental update invariant: only symbols in the dirty
+    /// file are dropped (plus their incident edges, which petgraph discards automatically),
+    /// while the rest of the workspace topology is left untouched. Runs in $O(k)$ where
+    /// $k$ is the number of symbols in the file, which is what keeps single-file
+    /// re-indexing well under the 5 ms budget.
     pub fn invalidate_file(&mut self, file_path: &Path) -> Vec<SymbolNode> {
         let Some(symbol_ids) = self.file_to_symbols.remove(file_path) else {
             return Vec::new();
@@ -194,6 +231,8 @@ impl CodeGraph {
         let mut removed = Vec::with_capacity(symbol_ids.len());
         for id in symbol_ids {
             if let Some(node_idx) = self.symbol_to_node.remove(&id) {
+                // Same swap-removal reconciliation as `remove_symbol`; it must be repeated
+                // per iteration because every removal can relocate a *different* node.
                 let old_last_idx = NodeIndex::new(self.graph.node_count().saturating_sub(1));
                 if let Some(node) = self.graph.remove_node(node_idx) {
                     if node_idx != old_last_idx && node_idx.index() < self.graph.node_count() {
@@ -208,6 +247,10 @@ impl CodeGraph {
     }
 
     /// Returns direct inbound callers / dependants of the specified symbol.
+    ///
+    /// This is the single-hop seed used by blast-radius analysis; it is intentionally
+    /// restricted to [`EdgeKind::Calls`] so that type references or imports do not
+    /// inflate impact estimates.
     #[must_use]
     pub fn get_callers<'a>(&'a self, id: &SymbolId) -> Vec<(&'a SymbolNode, &'a DependencyEdge)> {
         self.get_neighbors_by_direction(id, Direction::Incoming, Some(EdgeKind::Calls))
@@ -220,6 +263,11 @@ impl CodeGraph {
     }
 
     /// Returns direct neighbors of the symbol in a given direction, optionally filtered by edge kind.
+    ///
+    /// Direction mapping note: for [`Direction::Incoming`] the *other* endpoint of an edge is
+    /// its `source()` (the caller), for [`Direction::Outgoing`] it is its `target()`
+    /// (the callee). Callers of this function are the sole place translating petgraph's
+    /// edge orientation into "who calls whom" semantics.
     #[must_use]
     pub fn get_neighbors_by_direction<'a>(
         &'a self,
@@ -256,6 +304,10 @@ impl CodeGraph {
     ///
     /// The result is a list of `(SymbolNode, depth)` tuples, ordered by distance.
     /// Safely handles cyclic call graphs without infinite loops.
+    ///
+    /// Depth 1 means "direct caller"; the depth value is the exponential-decay exponent
+    /// consumed by the blast-radius risk scoring in `loom-analysis`, so it must stay an
+    /// exact shortest-path distance rather than an arbitrary visit order.
     #[must_use]
     pub fn find_transitive_callers(
         &self,
@@ -279,6 +331,16 @@ impl CodeGraph {
     }
 
     /// Generalized BFS traversal collecting reachable nodes and their topological depth.
+    ///
+    /// Single-pass, depth-bounded, cycle-safe BFS in $O(V + E)$ over the filtered sub-graph.
+    ///
+    /// Semantics:
+    /// - The root itself is **not** included in the results; every returned entry is a
+    ///   strict neighbor at depth `1..=max_depth`, ordered by BFS discovery (i.e. by
+    ///   topological distance, which is what blast-radius depth decay relies on).
+    /// - `max_depth == 0` yields an empty set: no expansion is requested at all.
+    /// - `visited` is seeded with the root so that self-recursive symbols (`a -> a`) and
+    ///   mutual recursion (`a -> b -> a`) terminate in one pass without duplicate entries.
     #[must_use]
     pub fn traverse_transitive(
         &self,
@@ -295,6 +357,9 @@ impl CodeGraph {
             return Vec::new();
         }
 
+        // All three containers are allocated up-front and reused; no intermediate
+        // collections are built per level, which is what keeps 50k-node traversals
+        // inside the < 2 ms budget.
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         let mut results = Vec::new();
@@ -303,6 +368,8 @@ impl CodeGraph {
         queue.push_back((root_idx, 0));
 
         while let Some((curr_idx, curr_depth)) = queue.pop_front() {
+            // Depth gate: nodes already at the limit are still recorded (they were pushed
+            // by their parent) but never expanded.
             if curr_depth >= max_depth {
                 continue;
             }
@@ -319,6 +386,8 @@ impl CodeGraph {
                     Direction::Outgoing => edge_ref.target(),
                 };
 
+                // `insert` returning true means "first visit": guarantees each node is
+                // reported once even in diamond or cyclic topologies.
                 if visited.insert(neighbor_idx) {
                     let next_depth = curr_depth + 1;
                     if let Some(node) = self.graph.node_weight(neighbor_idx) {
@@ -336,11 +405,16 @@ impl CodeGraph {
     ///
     /// Returns `Some(path)` containing all symbol nodes from `from` to `to` inclusive,
     /// or `None` if no path exists.
+    ///
+    /// Unweighted BFS, so the first time `to` is dequeued it is reached through a
+    /// minimum-edge-count route — no Dijkstra needed. `came_from` doubles as the
+    /// predecessor map used to reconstruct the path backwards from the target.
     #[must_use]
     pub fn find_shortest_path(&self, from: &SymbolId, to: &SymbolId) -> Option<Vec<SymbolNode>> {
         let &from_idx = self.symbol_to_node.get(from)?;
         let &to_idx = self.symbol_to_node.get(to)?;
 
+        // Trivial identity path: a symbol is trivially reachable from itself.
         if from_idx == to_idx {
             return self.graph.node_weight(from_idx).cloned().map(|n| vec![n]);
         }
@@ -354,11 +428,14 @@ impl CodeGraph {
 
         let mut found = false;
         while let Some(curr_idx) = queue.pop_front() {
+            // Dequeue-time check keeps the discovered path minimal (BFS level order).
             if curr_idx == to_idx {
                 found = true;
                 break;
             }
 
+            // Deliberately unfiltered: shortest-path discovery answers "how do I reach
+            // it", not "how do I call it", so all edge kinds participate.
             for edge_ref in self.graph.edges_directed(curr_idx, Direction::Outgoing) {
                 let neighbor_idx = edge_ref.target();
                 if visited.insert(neighbor_idx) {
@@ -372,6 +449,7 @@ impl CodeGraph {
             return None;
         }
 
+        // Walk predecessors from `to` back to `from`, then reverse into forward order.
         let mut path_indices = Vec::new();
         let mut curr = to_idx;
         path_indices.push(curr);

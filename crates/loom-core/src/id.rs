@@ -52,6 +52,17 @@ impl SymbolId {
     /// Deterministically computes a `SymbolId` from its canonical path, namespace hierarchy, name, and signature.
     ///
     /// Boundaries between components are delimited to guarantee collision resistance across variable-length fields.
+    ///
+    /// Without framing, `("ab", "c")` and `("a", "bc")` would hash the same bytes and silently
+    /// merge two distinct symbols. The scheme below is injective:
+    /// - `\0` terminates the file path and the whole namespace segment. `\0` cannot appear in
+    ///   a Rust/TypeScript/Python path or identifier, so it is an unambiguous separator.
+    /// - `::` separates individual namespace components, so `["foo","bar"]` and `["foobar"]`
+    ///   produce different byte streams.
+    ///
+    /// The result is truncated to 128 bits: ample for repository-scale collision safety
+    /// while keeping the ID a compact `Copy` value that is cheap to hash, store, and send
+    /// over JSON-RPC.
     #[must_use]
     pub fn derive(
         file_path: &str,
@@ -76,10 +87,11 @@ impl SymbolId {
         hasher.update(symbol_name.as_bytes());
         hasher.update(b"\0");
 
-        // Delimit signature
+        // Delimit signature (last component: no trailing delimiter needed)
         hasher.update(signature.as_bytes());
 
         let hash_output = hasher.finalize();
+        // Truncate to the leading 128 bits of the 256-bit BLAKE3 digest.
         let mut truncated = [0u8; 16];
         truncated.copy_from_slice(&hash_output.as_bytes()[..16]);
         Self(truncated)
@@ -119,6 +131,12 @@ impl TryFrom<&[u8]> for SymbolId {
     }
 }
 
+/// Manual Serde impl dispatching on the serializer's human-readability.
+///
+/// This split is what lets the same type serve both transports without a wrapper type:
+/// - **JSON / JSON-RPC (MCP)**: a 32-char hex string, debuggable and stable in caches.
+/// - **Binary (redb cache, postcard)**: the raw 16 bytes, avoiding a 2x size blow-up and
+///   a hex decode on every load.
 impl Serialize for SymbolId {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -132,6 +150,10 @@ impl Serialize for SymbolId {
     }
 }
 
+/// Mirror of [`Serialize`]: hex string for human-readable formats, raw bytes otherwise.
+///
+/// The `visit_seq` arm exists because several binary formats surface byte arrays as
+/// sequences rather than byte slices; without it, decoding those caches would fail.
 impl<'de> Deserialize<'de> for SymbolId {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where

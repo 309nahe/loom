@@ -1,3 +1,13 @@
+//! Integration tests for `CodeGraph` consistency under mutation and scale.
+//!
+//! Focus areas that unit tests cannot cover in isolation:
+//! - **Swap-removal safety**: repeatedly invalidating files must never desynchronize the
+//!   `symbol_to_node` index table from the underlying petgraph topology.
+//! - **Edge hygiene**: removing a file must also drop its incident edges, never leaving
+//!   dangling call references.
+//! - **Cyclic / multi-edge topologies**: recursion and diamond shapes must traverse once per
+//!   node without infinite loops.
+
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;
 use loom_core::symbol::{SymbolKind, SymbolNode};

@@ -1,3 +1,10 @@
+//! Correctness suite for transitive reachability and shortest-path pathfinding.
+//!
+//! Guards the guarantees the analysis layer depends on: BFS picks the *minimum-edge* route,
+//! recursion and cycles terminate cleanly, depth bounds are exact, and — critically for
+//! cacheable MCP responses — output ordering is byte-for-byte stable across repeated runs
+//! despite `HashMap` iteration being randomized per process.
+
 use loom_core::edge::{DependencyEdge, EdgeKind};
 use loom_core::id::SymbolId;
 use loom_core::symbol::{SymbolKind, SymbolNode};

@@ -1,3 +1,10 @@
+//! End-to-end test of the daemon indexing pipeline on a real polyglot workspace.
+//!
+//! Spins up a temporary Rust + TypeScript + Python workspace, indexes it via the parallel
+//! batch pipeline, asserts cross-file call resolution, then edits a file on disk and
+//! re-indexes it — verifying both the < 5 ms incremental budget and correct reconciliation
+//! of the shared graph state.
+
 use loom_daemon::pipeline::IndexingPipeline;
 use loom_graph::CodeGraph;
 use std::fs;

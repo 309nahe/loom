@@ -32,6 +32,10 @@ pub enum SymbolKind {
 
 impl SymbolKind {
     /// Returns true if this symbol represents a callable item (function or method).
+    ///
+    /// Load-bearing classification, not a convenience: the indexing pipeline uses it to
+    /// attribute a call site to the *innermost callable* rather than to its enclosing class
+    /// or module, and the analysis layer uses it to separate callers from containers.
     #[must_use]
     pub const fn is_callable(&self) -> bool {
         matches!(self, Self::Function | Self::Method)
@@ -89,8 +93,17 @@ pub struct SymbolNode {
     /// Exact declaration signature (e.g. `pub fn authenticate(req: Request) -> Result<User>`).
     pub signature: String,
     /// Whether this symbol is exported / publicly visible outside its immediate scope.
+    ///
+    /// Consumed by the analysis layer as a root classification: exported symbols and tests
+    /// are treated as entrypoints, which is what keeps dead-code detection from flagging
+    /// public API as unused.
     pub is_exported: bool,
     /// Incremental generational version counter for cache invalidation.
+    ///
+    /// The `SymbolId` is a content hash, so it is *unchanged* when a file is re-indexed even
+    /// though the node's line ranges and signature may have moved. `epoch` is what lets a
+    /// persistent cache or a long-lived reader tell "same symbol, new generation" apart from
+    /// "untouched", without hashing the whole node again.
     pub epoch: u64,
 }
 

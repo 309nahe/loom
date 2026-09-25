@@ -42,6 +42,10 @@ impl std::fmt::Display for EdgeKind {
 }
 
 /// A directed edge in the code graph representing a dependency between two symbols.
+///
+/// Orientation is always **source = dependant → target = dependency**, i.e. caller to callee.
+/// All traversal helpers in `loom-graph` rely on that convention, so reversing it here would
+/// silently invert every blast-radius calculation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyEdge {
     /// The specific category of dependency.
@@ -49,6 +53,9 @@ pub struct DependencyEdge {
     /// 1-indexed line number in the source file where this dependency originates.
     pub call_site_line: u32,
     /// Whether this dependency occurs inside a branching context (if, match, loop).
+    ///
+    /// Recorded so risk scoring can later discount dependencies that only execute on some
+    /// code paths, rather than treating every call site as certain.
     pub is_conditional: bool,
 }
 

@@ -1,3 +1,10 @@
+//! Accuracy suite pinning the exact arithmetic of the risk model and dead code reasons.
+//!
+//! Unlike the behavioural suites, these tests assert *numbers*: the $0.75^{\text{depth}}$
+//! decay, the 3.0x exported-boundary weight, the 15.0 base export penalty, the
+//! `RiskLevel` threshold boundaries, and dead code classification inside dense isolated
+//! cycles. Changing any constant in `blast_radius.rs` must break a test here.
+
 use loom_analysis::blast_radius::{BlastRadiusCalculator, RiskLevel};
 use loom_analysis::dead_code::{DeadCodeDetector, DeadSymbolReason};
 use loom_core::edge::{DependencyEdge, EdgeKind};
