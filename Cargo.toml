@@ -4,6 +4,7 @@ members = [
     "crates/loom-core",
     "crates/loom-graph",
     "crates/loom-ast",
+    "crates/loom-analysis",
     "crates/loom-daemon",
 ]
 
@@ -18,6 +19,7 @@ license = "MIT OR Apache-2.0"
 loom-core = { path = "crates/loom-core" }
 loom-graph = { path = "crates/loom-graph" }
 loom-ast = { path = "crates/loom-ast" }
+loom-analysis = { path = "crates/loom-analysis" }
 loom-daemon = { path = "crates/loom-daemon" }
 
 # Tree-sitter & Parsing
