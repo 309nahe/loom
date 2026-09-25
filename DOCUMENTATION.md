@@ -37,6 +37,16 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 4. **[Issue #8](https://github.com/309nahe/loom/issues/8) — `test(bench): implement comprehensive graph traversal benchmarks & real-world repo test suite`**
    - Scaled microbenchmarks ($10{,}000$ to $50{,}000$ nodes), $< 2\,\text{ms}$ traversal assertions, and topological edge-case suites.
 
+### 1.4 GitHub Issues Created for Phase 3 (MCP Server & Agent Integration)
+1. **[Issue #13](https://github.com/309nahe/loom/issues/13) — `feat(mcp): implement JSON-RPC 2.0 stdio MCP server loop with tokio`**
+   - stdio-only JSON-RPC 2.0 transport, `initialize` / `tools/list` / `tools/call` / `ping` dispatch, and concurrent execution alongside the file watcher.
+2. **[Issue #14](https://github.com/309nahe/loom/issues/14) — `feat(mcp): implement loom_get_blast_radius and loom_get_symbol_context tools`**
+   - The two schema-defined tools from IDEA.md §5.1–5.2, plus the `(file_path, symbol_name) → SymbolId` resolution layer and mandatory workspace-root path sanitization.
+3. **[Issue #15](https://github.com/309nahe/loom/issues/15) — `feat(mcp): implement loom_find_dead_symbols tool with server-side pagination`**
+   - Transport wrapper over `DeadCodeDetector` with subtree filtering, hard server-side `limit` enforcement, and explicit truncation reporting to protect agent context windows.
+4. **[Issue #16](https://github.com/309nahe/loom/issues/16) — `feat(mcp): client integration, config templates, and end-to-end stdio tests`**
+   - Cursor / Claude Code CLI config templates, subprocess-driven end-to-end JSON-RPC tests, README documentation, and manual verification in real clients.
+
 ---
 
 ## 2. Issue Deep-Dives & Implementation Logs
@@ -413,6 +423,22 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 ---
 
 ## 5. Changelog
+
+### [2026-09-26] - Phase 3 Inception: MCP Server & Agent Integration Issues
+
+- **Precondition**: All Phase 1 and Phase 2 roadmap items in `IDEA.md` §8 are implemented, tested, and merged (issues #1–#8, PRs #9–#12).
+- **Created Labels**: `phase-3`, `mcp`.
+- **Created Issues**:
+  - [Issue #13](https://github.com/309nahe/loom/issues/13): `feat(mcp): implement JSON-RPC 2.0 stdio MCP server loop with tokio`.
+  - [Issue #14](https://github.com/309nahe/loom/issues/14): `feat(mcp): implement loom_get_blast_radius and loom_get_symbol_context tools`.
+  - [Issue #15](https://github.com/309nahe/loom/issues/15): `feat(mcp): implement loom_find_dead_symbols tool with server-side pagination`.
+  - [Issue #16](https://github.com/309nahe/loom/issues/16): `feat(mcp): client integration, config templates, and end-to-end stdio tests`.
+- **Architectural Gaps Identified During Decomposition** (not yet implemented — these drive the issue scoping):
+  1. **Symbol resolution layer**: MCP tools are keyed by `(file_path, symbol_name)`, but `SymbolId` is `BLAKE3(file_path ‖ namespace ‖ name ‖ signature)` and the **signature is unknown at query time**. Tools cannot re-derive the hash and must resolve via the `file_to_symbols` reverse index. Ambiguity must be reported, never silently resolved.
+  2. **stdout is the protocol channel**: `tracing_subscriber::fmt()` defaults to stdout and would corrupt the JSON-RPC stream. All logging must be redirected to stderr in the MCP transport.
+  3. **Runtime restructuring**: `main()` currently awaits the initial batch scan and then blocks forever inside `DaemonWatcher::watch_loop`, so the process never reaches an MCP loop. The watcher and the server must run concurrently.
+  4. **Untrusted input boundary**: `file_path` arguments arrive from an external client and must be canonicalized and confined to the workspace root per `AGENTS.md` §5.
+- **Roadmap Alignment**: Maps Phase 3 of `IDEA.md` §8 onto four atomic deliverables, with stdio-only transport (no SSE) to honour the no-network-exfiltration boundary rule.
 
 ### [2026-09-26] - Architecture Commenting Pass (Documentation-Only Sweep)
 
