@@ -159,3 +159,69 @@ fn test_cyclic_dependencies_and_multiple_edge_kinds() {
     assert_eq!(callers_of_b.len(), 1); // Only calls, not instantiates
     assert_eq!(callers_of_b[0].0.id, id_a);
 }
+
+#[test]
+fn test_complex_diamond_and_multi_layer_reachability() {
+    let mut graph = CodeGraph::new();
+
+    // Diamond:
+    //      Entry
+    //      /   \
+    //   Left   Right
+    //      \   /
+    //     Target
+    //        |
+    //     Database
+    let entry = make_symbol("src/entry.rs", "entrypoint", 1);
+    let left = make_symbol("src/left.rs", "left_handler", 1);
+    let right = make_symbol("src/right.rs", "right_handler", 1);
+    let target = make_symbol("src/target.rs", "core_logic", 1);
+    let db = make_symbol("src/db.rs", "db_query", 1);
+
+    let id_entry = entry.id;
+    let id_left = left.id;
+    let id_right = right.id;
+    let id_target = target.id;
+    let id_db = db.id;
+
+    graph.upsert_symbol(entry);
+    graph.upsert_symbol(left);
+    graph.upsert_symbol(right);
+    graph.upsert_symbol(target);
+    graph.upsert_symbol(db);
+
+    let edge = DependencyEdge::new(EdgeKind::Calls, 10, false);
+    graph
+        .add_edge(id_entry, id_left, edge.clone())
+        .expect("entry->left");
+    graph
+        .add_edge(id_entry, id_right, edge.clone())
+        .expect("entry->right");
+    graph
+        .add_edge(id_left, id_target, edge.clone())
+        .expect("left->target");
+    graph
+        .add_edge(id_right, id_target, edge.clone())
+        .expect("right->target");
+    graph.add_edge(id_target, id_db, edge).expect("target->db");
+
+    // Transitive callers of Target (should be left, right, and entry)
+    let callers = graph.find_transitive_callers(&id_target, 5);
+    assert_eq!(callers.len(), 3);
+    let caller_names: Vec<&str> = callers.iter().map(|(s, _)| s.name.as_str()).collect();
+    assert!(caller_names.contains(&"left_handler"));
+    assert!(caller_names.contains(&"right_handler"));
+    assert!(caller_names.contains(&"entrypoint"));
+
+    // Transitive callees of Entry
+    let callees = graph.find_transitive_callees(&id_entry, 5);
+    assert_eq!(callees.len(), 4);
+
+    // Shortest path from entry to DB (length = 4 nodes: entry -> left/right -> target -> db)
+    let path = graph
+        .find_shortest_path(&id_entry, &id_db)
+        .expect("path exists");
+    assert_eq!(path.len(), 4);
+    assert_eq!(path[0].id, id_entry);
+    assert_eq!(path[3].id, id_db);
+}

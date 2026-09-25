@@ -1,6 +1,6 @@
 //! In-memory directed code dependency graph backed by `petgraph` with bidirectional lookup tables.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use loom_core::edge::{DependencyEdge, EdgeKind};
@@ -251,6 +251,147 @@ impl CodeGraph {
             })
             .collect()
     }
+
+    /// Returns transitive inbound callers up to `max_depth` BFS layers away.
+    ///
+    /// The result is a list of `(SymbolNode, depth)` tuples, ordered by distance.
+    /// Safely handles cyclic call graphs without infinite loops.
+    #[must_use]
+    pub fn find_transitive_callers(
+        &self,
+        root: &SymbolId,
+        max_depth: usize,
+    ) -> Vec<(SymbolNode, usize)> {
+        self.traverse_transitive(root, Direction::Incoming, Some(EdgeKind::Calls), max_depth)
+    }
+
+    /// Returns transitive outbound callees up to `max_depth` BFS layers away.
+    ///
+    /// The result is a list of `(SymbolNode, depth)` tuples, ordered by distance.
+    /// Safely handles cyclic call graphs without infinite loops.
+    #[must_use]
+    pub fn find_transitive_callees(
+        &self,
+        root: &SymbolId,
+        max_depth: usize,
+    ) -> Vec<(SymbolNode, usize)> {
+        self.traverse_transitive(root, Direction::Outgoing, Some(EdgeKind::Calls), max_depth)
+    }
+
+    /// Generalized BFS traversal collecting reachable nodes and their topological depth.
+    #[must_use]
+    pub fn traverse_transitive(
+        &self,
+        root: &SymbolId,
+        direction: Direction,
+        kind_filter: Option<EdgeKind>,
+        max_depth: usize,
+    ) -> Vec<(SymbolNode, usize)> {
+        let Some(&root_idx) = self.symbol_to_node.get(root) else {
+            return Vec::new();
+        };
+
+        if max_depth == 0 {
+            return Vec::new();
+        }
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut results = Vec::new();
+
+        visited.insert(root_idx);
+        queue.push_back((root_idx, 0));
+
+        while let Some((curr_idx, curr_depth)) = queue.pop_front() {
+            if curr_depth >= max_depth {
+                continue;
+            }
+
+            for edge_ref in self.graph.edges_directed(curr_idx, direction) {
+                if let Some(expected_kind) = kind_filter {
+                    if edge_ref.weight().kind != expected_kind {
+                        continue;
+                    }
+                }
+
+                let neighbor_idx = match direction {
+                    Direction::Incoming => edge_ref.source(),
+                    Direction::Outgoing => edge_ref.target(),
+                };
+
+                if visited.insert(neighbor_idx) {
+                    let next_depth = curr_depth + 1;
+                    if let Some(node) = self.graph.node_weight(neighbor_idx) {
+                        results.push((node.clone(), next_depth));
+                    }
+                    queue.push_back((neighbor_idx, next_depth));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Computes the shortest dependency path from `from` to `to` along outgoing dependency edges.
+    ///
+    /// Returns `Some(path)` containing all symbol nodes from `from` to `to` inclusive,
+    /// or `None` if no path exists.
+    #[must_use]
+    pub fn find_shortest_path(&self, from: &SymbolId, to: &SymbolId) -> Option<Vec<SymbolNode>> {
+        let &from_idx = self.symbol_to_node.get(from)?;
+        let &to_idx = self.symbol_to_node.get(to)?;
+
+        if from_idx == to_idx {
+            return self.graph.node_weight(from_idx).cloned().map(|n| vec![n]);
+        }
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        let mut came_from = HashMap::new();
+
+        visited.insert(from_idx);
+        queue.push_back(from_idx);
+
+        let mut found = false;
+        while let Some(curr_idx) = queue.pop_front() {
+            if curr_idx == to_idx {
+                found = true;
+                break;
+            }
+
+            for edge_ref in self.graph.edges_directed(curr_idx, Direction::Outgoing) {
+                let neighbor_idx = edge_ref.target();
+                if visited.insert(neighbor_idx) {
+                    came_from.insert(neighbor_idx, curr_idx);
+                    queue.push_back(neighbor_idx);
+                }
+            }
+        }
+
+        if !found {
+            return None;
+        }
+
+        let mut path_indices = Vec::new();
+        let mut curr = to_idx;
+        path_indices.push(curr);
+
+        while let Some(&prev) = came_from.get(&curr) {
+            path_indices.push(prev);
+            curr = prev;
+            if curr == from_idx {
+                break;
+            }
+        }
+
+        path_indices.reverse();
+        let path_nodes = path_indices
+            .into_iter()
+            .filter_map(|idx| self.graph.node_weight(idx).cloned())
+            .collect();
+
+        Some(path_nodes)
+    }
 }
 
 #[cfg(test)]
@@ -388,5 +529,107 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn test_transitive_callers_and_callees() {
+        let mut graph = CodeGraph::new();
+        // node_alpha -> node_beta -> node_gamma -> node_delta
+        let node_alpha = create_dummy_node("alpha", "src/alpha.rs", 1);
+        let node_beta = create_dummy_node("beta", "src/beta.rs", 1);
+        let node_gamma = create_dummy_node("gamma", "src/gamma.rs", 1);
+        let node_delta = create_dummy_node("delta", "src/delta.rs", 1);
+
+        let id_alpha = node_alpha.id;
+        let id_beta = node_beta.id;
+        let id_gamma = node_gamma.id;
+        let id_delta = node_delta.id;
+
+        graph.upsert_symbol(node_alpha);
+        graph.upsert_symbol(node_beta);
+        graph.upsert_symbol(node_gamma);
+        graph.upsert_symbol(node_delta);
+
+        let edge = DependencyEdge::new(EdgeKind::Calls, 10, false);
+        graph
+            .add_edge(id_alpha, id_beta, edge.clone())
+            .expect("add alpha->beta");
+        graph
+            .add_edge(id_beta, id_gamma, edge.clone())
+            .expect("add beta->gamma");
+        graph
+            .add_edge(id_gamma, id_delta, edge.clone())
+            .expect("add gamma->delta");
+
+        // Transitive callers of delta (max_depth 5)
+        let callers = graph.find_transitive_callers(&id_delta, 5);
+        assert_eq!(callers.len(), 3);
+        assert_eq!(callers[0].0.id, id_gamma);
+        assert_eq!(callers[0].1, 1);
+        assert_eq!(callers[1].0.id, id_beta);
+        assert_eq!(callers[1].1, 2);
+        assert_eq!(callers[2].0.id, id_alpha);
+        assert_eq!(callers[2].1, 3);
+
+        // Transitive callers of delta with max_depth 1
+        let shallow_callers = graph.find_transitive_callers(&id_delta, 1);
+        assert_eq!(shallow_callers.len(), 1);
+        assert_eq!(shallow_callers[0].0.id, id_gamma);
+
+        // Transitive outbound of alpha (max_depth 2)
+        let outbound = graph.find_transitive_callees(&id_alpha, 2);
+        assert_eq!(outbound.len(), 2);
+        assert_eq!(outbound[0].0.id, id_beta);
+        assert_eq!(outbound[0].1, 1);
+        assert_eq!(outbound[1].0.id, id_gamma);
+        assert_eq!(outbound[1].1, 2);
+    }
+
+    #[test]
+    fn test_find_shortest_path() {
+        let mut graph = CodeGraph::new();
+        // start -> mid_1 -> mid_2 -> destination
+        // start -> destination (direct shortcut)
+        let node_start = create_dummy_node("start", "src/start.rs", 1);
+        let node_mid1 = create_dummy_node("mid1", "src/mid1.rs", 1);
+        let node_mid2 = create_dummy_node("mid2", "src/mid2.rs", 1);
+        let node_dest = create_dummy_node("dest", "src/dest.rs", 1);
+        let node_isolated = create_dummy_node("isolated", "src/isolated.rs", 1);
+
+        let id_start = node_start.id;
+        let id_mid1 = node_mid1.id;
+        let id_mid2 = node_mid2.id;
+        let id_dest = node_dest.id;
+        let id_isolated = node_isolated.id;
+
+        graph.upsert_symbol(node_start);
+        graph.upsert_symbol(node_mid1);
+        graph.upsert_symbol(node_mid2);
+        graph.upsert_symbol(node_dest);
+        graph.upsert_symbol(node_isolated);
+
+        let edge = DependencyEdge::new(EdgeKind::Calls, 10, false);
+        graph
+            .add_edge(id_start, id_mid1, edge.clone())
+            .expect("add start->mid1");
+        graph
+            .add_edge(id_mid1, id_mid2, edge.clone())
+            .expect("add mid1->mid2");
+        graph
+            .add_edge(id_mid2, id_dest, edge.clone())
+            .expect("add mid2->dest");
+        graph
+            .add_edge(id_start, id_dest, edge)
+            .expect("add start->dest shortcut");
+
+        let path = graph
+            .find_shortest_path(&id_start, &id_dest)
+            .expect("path exists");
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].id, id_start);
+        assert_eq!(path[1].id, id_dest);
+
+        // Path to disconnected node
+        assert!(graph.find_shortest_path(&id_start, &id_isolated).is_none());
     }
 }
