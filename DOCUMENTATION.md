@@ -424,6 +424,21 @@ This document tracks engineering decisions, architectural trade-offs, challenges
 
 ## 5. Changelog
 
+### [2026-09-26] - USAGE.md Authored & Two Engine Bugs Discovered
+
+- **Delivered**: `USAGE.md` — user-facing guide covering what Loom is, its design pillars, per-crate architecture, build and library usage, extracted language constructs, measured performance, configuration, known limitations, and roadmap. All code samples and performance figures were **executed and verified** before being documented (a draft snippet was corrected after the compiler rejected a borrow error, and an invalid reproduction command was caught because its binary did not exist).
+- **Status documented honestly**: Phases 1–2 are complete; the MCP server (Phase 3) is not started, so Loom is currently usable as a library and a one-shot indexer, **not** as an agent-facing tool.
+- **Bug #1 — File watcher re-index loop (reproducible, affects release builds)**:
+  - A single file write causes the daemon to re-index that file **~20×/second indefinitely**. Idle periods are clean (0 events); the loop only begins after a content event. Measured 198 events / 10 s and 397 events / 20 s — perfectly linear, no decay. Reproduced with both `target/debug` and `target/release` binaries, so it is not a debug-only timing artifact.
+  - Graph correctness is preserved (each individual re-index is ~250 µs and idempotent), so the impact is sustained CPU burn and log flooding rather than data corruption.
+  - Suspected root cause: the dependency set resolves **two incompatible `notify` versions** — `notify-debouncer-mini` 0.5.0 pulls `notify` 7.0.0 while the workspace also declares `notify` 8.2.0. The direct `notify` dependency is in fact **unused by every source file** (all watcher code goes through the `notify_debouncer_mini::notify` re-export), so the 8.2.0 copy is dead weight and the debouncer's tick logic is running against an unaligned notify major.
+- **Bug #2 — Call edges resolved by name repo-wide, with no scoping**:
+  - `IndexingPipeline` resolves each call by matching `callee_name` against **every** symbol with that name in the entire graph, with no module path, import, or receiver-type scoping.
+  - This produces false edges between unrelated same-named functions and severe edge fan-out: indexing this repository yields **2781 edges for 210 symbols (~13 edges/symbol)**, far above real call structure.
+  - Consequence: blast-radius counts and risk scores are directionally useful but systematically **overstate** impact until resolution is scoped.
+- **Additional gaps recorded in `USAGE.md`**: `docstring` never populated, `is_conditional` always `false`, Rust methods classified as `Function` (the Rust SCM query has no `def.method` capture — only TypeScript does), dead-code analysis treats exported symbols as live roots, and no `redb` persistence yet.
+- **Next step proposed**: file Phase 3 bug issues for the watcher loop and name-resolution fan-out before starting Issue #13, since the MCP surface will expose both flaws directly to agents.
+
 ### [2026-09-26] - Phase 3 Inception: MCP Server & Agent Integration Issues
 
 - **Precondition**: All Phase 1 and Phase 2 roadmap items in `IDEA.md` §8 are implemented, tested, and merged (issues #1–#8, PRs #9–#12).
